@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.*
+**/*api_key*
+**/*API_KEY*
+POLYGON_API_KEY_ADVANCED_DATA.md
+
+# Data / caches
+data/
+cache/
+_cache/
+*.parquet
+*.duckdb
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Source materials
+# PDFs are intentionally NOT ignored (repo is private), but keep secrets out.

@@ -1,0 +1,56 @@
+# Strategy configuration (MVP / Phase A watchlist).
+#
+# Design goals:
+# - No look-forward bias (causal features, "high so far" only).
+# - Intraday-only positions (flat EOD).
+# - Conservative execution (slippage).
+
+timezone: America/New_York
+
+watchlist:
+  method: open_gap   # open_gap | premarket_gap (future)
+  top_n: 20
+  min_gap_pct: 0.05
+  min_prev_close: 0.50
+  max_prev_close: 20.0
+
+session:
+  premarket_start: "04:00"
+  premarket_end: "09:29"
+  trade_start: "09:30"
+  trade_end: "11:00"
+  force_flat: "16:00"
+
+execution:
+  slippage:
+    model: fixed_cents
+    cents: 0.02
+  fees_per_trade: 0.00
+
+risk:
+  max_trades_per_day: 5
+  max_daily_loss_pct: 0.02
+  cooldown_minutes_after_stop: 2
+
+strategy_small_caps:
+  allow_short: false
+  allow_starter_entries: true
+  starter_fraction: 0.25
+
+  risk:
+    stop_buffer_pct: 0.001
+
+  macro_filter:
+    require_above_ema_34: true
+    require_above_ema_55: true
+    require_above_sma_200: false
+
+  entry:
+    require_pmh_breakout: true
+    max_extension_from_ema8_pct: 0.015
+    require_momentum_bull: true
+
+  exits:
+    exit_on_close_below_ema8: true
+    exit_on_ttm_momentum_bear: true
+    scale_out_first_fraction: 0.50

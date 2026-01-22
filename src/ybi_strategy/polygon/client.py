@@ -62,7 +62,7 @@ class PolygonClient:
         return results
 
     def minute_bars(self, ticker: str, d: date) -> list[dict[str, Any]]:
-        # Returns 1-minute aggregates for the requested date. Polygon’s behavior regarding
+        # Returns 1-minute aggregates for the requested date. Polygon's behavior regarding
         # extended hours varies by entitlement and endpoint semantics; we treat whatever is returned
         # as authoritative and then filter timestamps in the strategy layer.
         path = f"/v2/aggs/ticker/{ticker}/range/1/minute/{d.isoformat()}/{d.isoformat()}"
@@ -71,3 +71,12 @@ class PolygonClient:
         if not isinstance(results, list):
             raise PolygonError("Unexpected minute_bars results shape.")
         return results
+
+    def daily_bar(self, ticker: str, d: date) -> dict[str, Any] | None:
+        """Fetch single day's OHLCV for a ticker. Returns None if no data."""
+        path = f"/v2/aggs/ticker/{ticker}/range/1/day/{d.isoformat()}/{d.isoformat()}"
+        data = self._get(path, params={"adjusted": "true"})
+        results = data.get("results", [])
+        if not isinstance(results, list) or not results:
+            return None
+        return results[0]

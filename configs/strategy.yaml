@@ -31,6 +31,15 @@ risk:
   max_trades_per_day: 5
   max_daily_loss_pct: 0.02
   cooldown_minutes_after_stop: 2
+  account_equity: 10000.0
+
+# Portfolio-level configuration
+# This enables proper capital management and prevents impossible overlapping positions
+portfolio:
+  enabled: true                 # Use portfolio-level simulation (recommended)
+  max_positions: 3              # Maximum concurrent open positions
+  max_position_pct: 0.25        # Maximum position size as % of equity
+  risk_per_trade_pct: 0.01      # Risk per trade as % of equity (for position sizing)
 
 strategy_small_caps:
   allow_short: false

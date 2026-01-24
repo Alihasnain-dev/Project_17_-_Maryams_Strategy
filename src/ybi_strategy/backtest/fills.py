@@ -8,8 +8,10 @@ class FillModel:
     """
     Models execution slippage and fees for backtesting.
 
-    Supported slippage models:
-    - fixed_cents: Fixed dollar amount slippage per share (e.g., 0.02 = 2 cents)
+    SLIPPAGE MODELS:
+    - fixed_cents: Fixed DOLLAR amount slippage per share.
+      NOTE: Despite the name "cents", the value is in DOLLARS.
+      Example: cents=0.02 means $0.02 per share (2 cents).
     - pct_of_price: Percentage of price slippage (e.g., 0.001 = 0.1%)
     - tiered: Tiered slippage based on price level
 
@@ -18,19 +20,18 @@ class FillModel:
     - Exit: price - slippage (worse fill for longs)
 
     FEE CONVENTION:
-    - fees_per_trade: Fee applied ONCE per round-trip (on exit only).
-      This represents the total cost of opening and closing a position.
+    - fees_per_trade: Fee applied ONCE per round-trip (on final exit only).
+      This is NOT applied on partial scale-outs, only when the trade closes.
       Example: fees_per_trade=1.0 means $1 total fee per round-trip.
 
-    The fee is deducted from cash and P&L on exit:
-      pnl = (exit_px - entry_px) * qty - fees_per_trade
-      cash += (exit_px * qty - fees_per_trade)
+    For a trade with scale-out:
+      total_pnl = scale_out_pnl + final_exit_pnl - fees_per_trade
 
-    This is mathematically equivalent to splitting the fee half on entry
-    and half on exit, or using per-order fees of fees_per_trade/2.
+    Where scale_out_pnl has NO fee deduction (fee is on final exit only).
     """
 
     model: str
+    # NOTE: "cents" is a misnomer - value is in DOLLARS (0.02 = $0.02 = 2 cents)
     cents: float = 0.0  # Used by fixed_cents model
     pct: float = 0.0  # Used by pct_of_price model
 

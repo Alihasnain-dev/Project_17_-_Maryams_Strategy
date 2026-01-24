@@ -903,16 +903,28 @@ def compute_regime_analysis(
 
 
 # =============================================================================
-# TRUE NEGATIVE CONTROLS (break signal→return structure to detect leakage)
+# HEURISTIC STRESS TESTS (NOT true negative controls for leakage detection)
+# =============================================================================
+#
+# IMPORTANT LIMITATION: These tests operate on already-realized P&L values.
+# They do NOT resimulate the backtest with modified entry times using price data.
+# Therefore, they CANNOT reliably detect lookahead bias.
+#
+# For true lookahead detection, verify:
+# 1. signal_ts < entry_ts for all trades (tested elsewhere)
+# 2. Indicators use only past data (code review)
+# 3. Watchlist uses only data available at selection time (code review)
+#
+# These stress tests are kept for informational purposes but their outputs
+# should NOT be interpreted as evidence for or against lookahead bias.
 # =============================================================================
 
 @dataclass
-class LeakageControlResult:
-    """Result of a leakage-detecting negative control test.
+class StressTestResult:
+    """Result of a heuristic stress test.
 
-    These tests break the signal→return relationship that would exist if
-    there were lookahead bias. If the strategy still shows edge after
-    breaking the relationship, that indicates a data/methodology problem.
+    IMPORTANT: These are NOT true negative controls for leakage detection.
+    They operate on realized P&L and cannot detect lookahead bias.
     """
     method: str = ""
     n_simulations: int = 0
@@ -923,15 +935,11 @@ class LeakageControlResult:
     observed_total_pnl: float = 0.0
     observed_win_rate: float = 0.0
 
-    # Null distribution (after breaking signal→return)
-    null_mean_pnl: float = 0.0
-    null_std_pnl: float = 0.0
-    null_total_pnl_mean: float = 0.0
-    null_win_rate_mean: float = 0.0
-
-    # Verification: null should be ~0 edge
-    null_is_centered: bool = False  # True if null mean is close to 0
-    null_has_variance: bool = False  # True if null_std > 0
+    # Perturbed distribution statistics
+    perturbed_mean_pnl: float = 0.0
+    perturbed_std_pnl: float = 0.0
+    perturbed_total_pnl_mean: float = 0.0
+    perturbed_win_rate_mean: float = 0.0
 
     # Interpretation
     interpretation: str = ""
@@ -945,14 +953,16 @@ class LeakageControlResult:
             "observed_mean_pnl": round(self.observed_mean_pnl, 4),
             "observed_total_pnl": round(self.observed_total_pnl, 2),
             "observed_win_rate": round(self.observed_win_rate, 4),
-            "null_mean_pnl": round(self.null_mean_pnl, 4),
-            "null_std_pnl": round(self.null_std_pnl, 4),
-            "null_total_pnl_mean": round(self.null_total_pnl_mean, 2),
-            "null_win_rate_mean": round(self.null_win_rate_mean, 4),
-            "null_is_centered": bool(self.null_is_centered),
-            "null_has_variance": bool(self.null_has_variance),
+            "perturbed_mean_pnl": round(self.perturbed_mean_pnl, 4),
+            "perturbed_std_pnl": round(self.perturbed_std_pnl, 4),
+            "perturbed_total_pnl_mean": round(self.perturbed_total_pnl_mean, 2),
+            "perturbed_win_rate_mean": round(self.perturbed_win_rate_mean, 4),
             "interpretation": self.interpretation,
         }
+
+
+# Keep old name as alias for backwards compatibility
+LeakageControlResult = StressTestResult
 
 
 def time_shift_negative_control(
@@ -960,29 +970,27 @@ def time_shift_negative_control(
     shift_minutes: int = 5,
     n_simulations: int = 1000,
     random_seed: int | None = None,
-) -> LeakageControlResult:
+) -> StressTestResult:
     """
-    Negative control: shift entry timestamps forward by k minutes.
+    HEURISTIC stress test: perturb P&L to simulate delayed entries.
 
-    This breaks the signal→return relationship by making entries LATE.
-    If the strategy had lookahead bias (e.g., same-bar fills), shifting
-    entries forward would not affect performance. If the strategy is
-    causal, shifting entries should degrade performance toward zero.
+    IMPORTANT LIMITATION: This does NOT actually resimulate with shifted
+    entry times using price data. It randomly drops trades and adds noise
+    to existing P&L values. This CANNOT detect lookahead bias.
 
-    EXPECTED RESULT: Null distribution should be centered near zero edge.
-    If null still shows significant edge, investigate data/execution issues.
+    For actual lookahead detection, verify signal_ts < entry_ts for all trades.
 
     Args:
-        trades_df: DataFrame with 'pnl', 'entry_ts', 'signal_ts' columns.
-        shift_minutes: Minutes to shift entries forward (default 5).
+        trades_df: DataFrame with 'pnl' column.
+        shift_minutes: Conceptual shift (affects drop probability).
         n_simulations: Number of simulations.
         random_seed: Optional seed for reproducibility.
 
     Returns:
-        LeakageControlResult with null distribution statistics.
+        StressTestResult with perturbed distribution statistics.
     """
-    result = LeakageControlResult(
-        method=f"time_shift_{shift_minutes}min",
+    result = StressTestResult(
+        method=f"time_shift_heuristic_{shift_minutes}min",
         n_simulations=n_simulations,
     )
 
@@ -1001,59 +1009,42 @@ def time_shift_negative_control(
     if random_seed is not None:
         np.random.seed(random_seed)
 
-    # Simulate: for each iteration, randomly drop some trades
-    # (simulating that shifted entries would miss some opportunities)
-    # This is a proxy for the effect of delayed entries
-    null_means: list[float] = []
-    null_totals: list[float] = []
-    null_win_rates: list[float] = []
+    # Heuristic: randomly drop some trades and add noise
+    # This is NOT a true negative control - just a stress test
+    perturbed_means: list[float] = []
+    perturbed_totals: list[float] = []
+    perturbed_win_rates: list[float] = []
 
     for _ in range(n_simulations):
-        # Drop fraction of trades proportional to shift
-        # (longer shift = more missed opportunities)
-        drop_prob = min(0.5, shift_minutes / 60.0)  # Max 50% drop
+        drop_prob = min(0.5, shift_minutes / 60.0)
         keep_mask = np.random.random(len(pnl)) > drop_prob
 
         if keep_mask.sum() > 0:
             sample_pnl = pnl[keep_mask]
-            # Add noise to P&L (simulating worse fills from delayed entry)
             noise = np.random.normal(0, abs(result.observed_mean_pnl) * 0.5, len(sample_pnl))
             adjusted_pnl = sample_pnl + noise
 
-            null_means.append(float(adjusted_pnl.mean()))
-            null_totals.append(float(adjusted_pnl.sum()))
-            null_win_rates.append(float((adjusted_pnl > 0).mean()))
+            perturbed_means.append(float(adjusted_pnl.mean()))
+            perturbed_totals.append(float(adjusted_pnl.sum()))
+            perturbed_win_rates.append(float((adjusted_pnl > 0).mean()))
         else:
-            null_means.append(0.0)
-            null_totals.append(0.0)
-            null_win_rates.append(0.0)
+            perturbed_means.append(0.0)
+            perturbed_totals.append(0.0)
+            perturbed_win_rates.append(0.0)
 
-    # Compute null statistics
-    result.null_mean_pnl = float(np.mean(null_means))
-    result.null_std_pnl = float(np.std(null_means))
-    result.null_total_pnl_mean = float(np.mean(null_totals))
-    result.null_win_rate_mean = float(np.mean(null_win_rates))
+    # Compute statistics
+    result.perturbed_mean_pnl = float(np.mean(perturbed_means))
+    result.perturbed_std_pnl = float(np.std(perturbed_means))
+    result.perturbed_total_pnl_mean = float(np.mean(perturbed_totals))
+    result.perturbed_win_rate_mean = float(np.mean(perturbed_win_rates))
 
-    # Verify null is well-behaved
-    result.null_has_variance = result.null_std_pnl > 0
-    # Null should be closer to zero than observed (degraded performance)
-    result.null_is_centered = abs(result.null_mean_pnl) < abs(result.observed_mean_pnl) * 0.5
-
-    # Interpretation
-    if not result.null_has_variance:
-        result.interpretation = "WARNING: Null distribution has zero variance (degenerate)."
-    elif result.null_is_centered:
-        result.interpretation = (
-            f"Shifting entries by {shift_minutes}min degrades mean P&L from "
-            f"${result.observed_mean_pnl:.2f} to ${result.null_mean_pnl:.2f}. "
-            "This is expected for a causal strategy."
-        )
-    else:
-        result.interpretation = (
-            f"WARNING: Shifting entries by {shift_minutes}min shows mean P&L "
-            f"${result.null_mean_pnl:.2f} (observed: ${result.observed_mean_pnl:.2f}). "
-            "Investigate potential lookahead or execution issues."
-        )
+    # Interpretation - be honest about limitations
+    result.interpretation = (
+        f"Heuristic perturbation test (NOT a true leakage control). "
+        f"Observed mean: ${result.observed_mean_pnl:.2f}, "
+        f"Perturbed mean: ${result.perturbed_mean_pnl:.2f} (std: ${result.perturbed_std_pnl:.2f}). "
+        f"For lookahead detection, verify signal_ts < entry_ts for all trades."
+    )
 
     return result
 
@@ -1062,26 +1053,25 @@ def shuffle_dates_negative_control(
     trades_df: pd.DataFrame,
     n_simulations: int = 1000,
     random_seed: int | None = None,
-) -> LeakageControlResult:
+) -> StressTestResult:
     """
-    Negative control: shuffle trade dates while preserving per-day trade counts.
+    HEURISTIC stress test: permute P&L values.
 
-    This breaks the signal→return relationship by assigning P&L outcomes
-    to random dates, destroying any genuine predictive relationship.
-
-    EXPECTED RESULT: Null distribution should be centered near zero edge
-    (random assignment of wins/losses should average out).
+    IMPORTANT LIMITATION: Permuting P&L values does NOT break the signal→return
+    relationship because it operates on realized outcomes, not on price data.
+    The mean is permutation-invariant, so this test has near-zero variance
+    and CANNOT detect lookahead bias.
 
     Args:
-        trades_df: DataFrame with 'pnl' and 'date' columns.
+        trades_df: DataFrame with 'pnl' column.
         n_simulations: Number of simulations.
         random_seed: Optional seed for reproducibility.
 
     Returns:
-        LeakageControlResult with null distribution statistics.
+        StressTestResult with perturbed distribution statistics.
     """
-    result = LeakageControlResult(
-        method="shuffle_dates",
+    result = StressTestResult(
+        method="shuffle_heuristic",
         n_simulations=n_simulations,
     )
 
@@ -1100,36 +1090,207 @@ def shuffle_dates_negative_control(
     if random_seed is not None:
         np.random.seed(random_seed)
 
-    # Simulate: shuffle P&L values
-    null_means: list[float] = []
-    null_totals: list[float] = []
-    null_win_rates: list[float] = []
+    # Shuffle P&L values (permutation-invariant for mean, so std ≈ 0)
+    perturbed_means: list[float] = []
+    perturbed_totals: list[float] = []
+    perturbed_win_rates: list[float] = []
 
     for _ in range(n_simulations):
         shuffled_pnl = np.random.permutation(pnl)
-        null_means.append(float(np.mean(shuffled_pnl)))
-        null_totals.append(float(np.sum(shuffled_pnl)))
-        null_win_rates.append(float((shuffled_pnl > 0).mean()))
+        perturbed_means.append(float(np.mean(shuffled_pnl)))
+        perturbed_totals.append(float(np.sum(shuffled_pnl)))
+        perturbed_win_rates.append(float((shuffled_pnl > 0).mean()))
 
-    # Compute null statistics
-    result.null_mean_pnl = float(np.mean(null_means))
-    result.null_std_pnl = float(np.std(null_means))
-    result.null_total_pnl_mean = float(np.mean(null_totals))
-    result.null_win_rate_mean = float(np.mean(null_win_rates))
+    # Compute statistics
+    result.perturbed_mean_pnl = float(np.mean(perturbed_means))
+    result.perturbed_std_pnl = float(np.std(perturbed_means))
+    result.perturbed_total_pnl_mean = float(np.mean(perturbed_totals))
+    result.perturbed_win_rate_mean = float(np.mean(perturbed_win_rates))
 
-    # Verify null is well-behaved
-    result.null_has_variance = result.null_std_pnl > 0
-    # For shuffle test, null mean should equal observed mean (sum is preserved)
-    # but daily clustering is destroyed
-    result.null_is_centered = abs(result.null_mean_pnl - result.observed_mean_pnl) < 0.01
-
-    # NOTE: This test verifies the permutation is working, but shuffling
-    # P&L directly preserves total P&L (sum-invariant). The VALUE of this
-    # test is limited - it mainly confirms the null distribution code works.
+    # Be honest about the limitations
     result.interpretation = (
-        f"Shuffle test: null mean ${result.null_mean_pnl:.4f} ≈ observed ${result.observed_mean_pnl:.4f} "
-        f"(expected since sum is preserved). Null std: ${result.null_std_pnl:.4f}. "
-        "This confirms non-degenerate null. For leakage detection, use time_shift test."
+        f"Shuffle heuristic (NOT a true leakage control). "
+        f"Mean is permutation-invariant so std≈0 (got ${result.perturbed_std_pnl:.4f}). "
+        f"This test cannot detect lookahead bias. "
+        f"For lookahead detection, verify signal_ts < entry_ts for all trades."
+    )
+
+    return result
+
+
+# =============================================================================
+# P&L RECONCILIATION
+# =============================================================================
+
+
+@dataclass
+class ReconciliationResult:
+    """Result of reconciling trades.csv P&L against fills.csv reconstructed P&L."""
+
+    is_consistent: bool = True
+    total_trades: int = 0
+    trades_with_discrepancy: int = 0
+    max_discrepancy: float = 0.0
+    total_discrepancy: float = 0.0
+
+    # Trade P&L totals
+    trades_total_pnl: float = 0.0
+    fills_reconstructed_pnl: float = 0.0
+    difference: float = 0.0
+
+    # Details for debugging
+    discrepancies: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "is_consistent": self.is_consistent,
+            "total_trades": self.total_trades,
+            "trades_with_discrepancy": self.trades_with_discrepancy,
+            "max_discrepancy": self.max_discrepancy,
+            "total_discrepancy": self.total_discrepancy,
+            "trades_total_pnl": self.trades_total_pnl,
+            "fills_reconstructed_pnl": self.fills_reconstructed_pnl,
+            "difference": self.difference,
+            "discrepancies": self.discrepancies[:10] if self.discrepancies else [],  # Limit to first 10
+        }
+
+
+def reconcile_trades_and_fills(
+    trades_df: pd.DataFrame,
+    fills_df: pd.DataFrame,
+    tolerance: float = 0.01,  # $0.01 tolerance for floating point
+    fees_per_trade: float = 0.0,
+) -> ReconciliationResult:
+    """
+    Reconcile trade P&L against fill-reconstructed P&L.
+
+    This verifies that the P&L recorded in trades.csv matches what would be
+    computed from the fills in fills.csv. This catches accounting bugs like:
+    - Missing partial scale-out P&L in trade records
+    - Double-counting fees
+    - Incorrect quantity tracking
+
+    Algorithm:
+    1. Group fills by (date, ticker)
+    2. For each group, match BUY and SELL fills
+    3. Compute P&L as: sum(sell_qty * sell_px) - sum(buy_qty * buy_px) - fees
+    4. Compare against trade P&L
+
+    Args:
+        trades_df: DataFrame with columns ['date', 'ticker', 'pnl']
+        fills_df: DataFrame with columns ['date', 'ticker', 'side', 'qty', 'price']
+        tolerance: Maximum acceptable discrepancy in dollars
+        fees_per_trade: Fees per round-trip (applied once per complete trade)
+
+    Returns:
+        ReconciliationResult with consistency verdict and discrepancies
+    """
+    result = ReconciliationResult()
+
+    if trades_df.empty:
+        result.is_consistent = True
+        return result
+
+    if fills_df.empty:
+        result.is_consistent = False
+        result.discrepancies.append({
+            "error": "No fills provided but trades exist",
+            "trades_count": len(trades_df),
+        })
+        return result
+
+    # Ensure required columns exist
+    for col in ["date", "ticker", "pnl"]:
+        if col not in trades_df.columns:
+            raise ValueError(f"trades_df missing required column: {col}")
+
+    for col in ["date", "ticker", "side", "qty", "price"]:
+        if col not in fills_df.columns:
+            raise ValueError(f"fills_df missing required column: {col}")
+
+    # Convert to standard types
+    trades = trades_df.copy()
+    fills = fills_df.copy()
+
+    trades["date"] = trades["date"].astype(str)
+    trades["ticker"] = trades["ticker"].astype(str)
+    fills["date"] = fills["date"].astype(str)
+    fills["ticker"] = fills["ticker"].astype(str)
+    fills["qty"] = fills["qty"].astype(float)
+    fills["price"] = fills["price"].astype(float)
+    fills["side"] = fills["side"].astype(str)
+
+    # Group fills by (date, ticker)
+    fill_groups = fills.groupby(["date", "ticker"])
+
+    # Group trades by (date, ticker) - may have multiple trades per day per ticker
+    # We need to match trade sequences with fill sequences
+
+    result.total_trades = len(trades)
+    result.trades_total_pnl = float(trades["pnl"].sum())
+
+    # Reconstruct P&L from fills
+    reconstructed_pnl_total = 0.0
+
+    for (date, ticker), group in fill_groups:
+        buys = group[group["side"] == "BUY"]
+        sells = group[group["side"] == "SELL"]
+
+        # Total cost of buys
+        total_buy_cost = (buys["qty"] * buys["price"]).sum()
+        total_buy_qty = buys["qty"].sum()
+
+        # Total proceeds from sells
+        total_sell_proceeds = (sells["qty"] * sells["price"]).sum()
+        total_sell_qty = sells["qty"].sum()
+
+        # Verify quantities match (position should be flat at end of day)
+        if abs(total_buy_qty - total_sell_qty) > 0.001:
+            result.discrepancies.append({
+                "date": date,
+                "ticker": ticker,
+                "error": "Quantity mismatch",
+                "buy_qty": float(total_buy_qty),
+                "sell_qty": float(total_sell_qty),
+            })
+
+        # Count complete trades (each BUY that starts a position = 1 trade)
+        # For simplicity, count trades where entry_ts changes
+        n_trades_in_group = len(buys)  # Each BUY starts a new trade
+
+        # Reconstructed P&L = proceeds - cost - fees
+        # Fees applied once per trade (round-trip)
+        group_pnl = total_sell_proceeds - total_buy_cost - (fees_per_trade * n_trades_in_group)
+        reconstructed_pnl_total += group_pnl
+
+        # Find matching trades in trades_df
+        matching_trades = trades[(trades["date"] == date) & (trades["ticker"] == ticker)]
+        trades_pnl = matching_trades["pnl"].sum()
+
+        # Check for discrepancy
+        discrepancy = abs(group_pnl - trades_pnl)
+        if discrepancy > tolerance:
+            result.trades_with_discrepancy += 1
+            result.total_discrepancy += discrepancy
+            result.max_discrepancy = max(result.max_discrepancy, discrepancy)
+            result.discrepancies.append({
+                "date": date,
+                "ticker": ticker,
+                "fills_reconstructed_pnl": float(group_pnl),
+                "trades_pnl": float(trades_pnl),
+                "discrepancy": float(discrepancy),
+                "buys": len(buys),
+                "sells": len(sells),
+            })
+
+    result.fills_reconstructed_pnl = reconstructed_pnl_total
+    result.difference = abs(result.trades_total_pnl - result.fills_reconstructed_pnl)
+
+    # Check overall consistency
+    result.is_consistent = (
+        result.trades_with_discrepancy == 0 and
+        result.difference <= tolerance * result.total_trades
     )
 
     return result

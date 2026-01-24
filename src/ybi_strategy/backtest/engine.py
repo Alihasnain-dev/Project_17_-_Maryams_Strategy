@@ -23,6 +23,7 @@ from ybi_strategy.backtest.portfolio import simulate_portfolio_day
 from ybi_strategy.strategy.ybi_small_caps import simulate_ybi_small_caps, DayRiskState
 from ybi_strategy.timeutils import SessionTimes, parse_hhmm
 from ybi_strategy.universe.watchlist import build_watchlist_open_gap
+from ybi_strategy.calendar import is_market_holiday, is_weekend
 from ybi_strategy.reporting.metrics import compute_metrics, compute_daily_metrics
 from ybi_strategy.reporting.analysis import (
     stratified_analysis,
@@ -151,11 +152,22 @@ class BacktestEngine:
             d = day_ts.date()
 
             # Skip weekends
-            if day_ts.dayofweek >= 5:
+            if is_weekend(d):
                 day_audit.append({
                     "date": d.isoformat(),
                     "status": "weekend",
-                    "reason": "Saturday" if day_ts.dayofweek == 5 else "Sunday",
+                    "reason": "Saturday" if d.weekday() == 5 else "Sunday",
+                    "watchlist_count": 0,
+                    "trades": 0,
+                })
+                continue
+
+            # CRITICAL FIX: Skip market holidays (must be excluded from daily series)
+            if is_market_holiday(d):
+                day_audit.append({
+                    "date": d.isoformat(),
+                    "status": "holiday_closed",
+                    "reason": "US market holiday - market closed",
                     "watchlist_count": 0,
                     "trades": 0,
                 })
@@ -216,25 +228,28 @@ class BacktestEngine:
         total_days = len(audit_df)
         ok_days = len(audit_df[audit_df["status"] == "ok"])
         weekend_days = len(audit_df[audit_df["status"] == "weekend"])
-        trading_days_attempted = total_days - weekend_days
+        holiday_days = len(audit_df[audit_df["status"] == "holiday_closed"])
+        # CRITICAL FIX: trading_days_attempted excludes weekends AND holidays
+        trading_days_attempted = total_days - weekend_days - holiday_days
         days_with_trades = ok_days
         days_with_errors = len(audit_df[audit_df["status"] == "error"])
 
-        # CRITICAL: Extract ELIGIBLE trading days (exclude error days)
+        # CRITICAL: Extract ELIGIBLE trading days (exclude error days AND holidays)
         # Error days are MISSING DATA, not "flat performance" - they must be excluded
         # from the daily P&L series to avoid biasing Sharpe/significance statistics.
+        # Holidays (market closed) must also be excluded - no trading could occur.
         # Valid statuses for inclusion: ok, no_trades, no_watchlist
         eligible_statuses = ["ok", "no_trades", "no_watchlist"]
         eligible_trading_days = audit_df[audit_df["status"].isin(eligible_statuses)]["date"].tolist()
 
-        # all_trading_days is now only eligible days (error days excluded)
+        # all_trading_days is now only eligible days (error days and holidays excluded)
         all_trading_days = eligible_trading_days
 
         # Compute comprehensive metrics
         summary_path = self.output_dir / "summary.json"
         summary = self._summarize(trades_df, watchlist_df, all_trading_days=all_trading_days)
 
-        # Compute eligible trading days (excluding errors - missing data)
+        # Compute eligible trading days (excluding errors and holidays)
         days_no_trades = len(audit_df[audit_df["status"] == "no_trades"])
         days_no_watchlist = len(audit_df[audit_df["status"] == "no_watchlist"])
         eligible_trading_days_count = ok_days + days_no_trades + days_no_watchlist
@@ -243,6 +258,7 @@ class BacktestEngine:
         summary["day_audit"] = {
             "total_calendar_days": total_days,
             "weekend_days": weekend_days,
+            "holiday_days": holiday_days,
             "trading_days_attempted": trading_days_attempted,
             "days_with_trades": days_with_trades,
             "days_with_no_trades": days_no_trades,
@@ -252,7 +268,7 @@ class BacktestEngine:
             "data_completeness_pct": round(eligible_trading_days_count / trading_days_attempted * 100, 1) if trading_days_attempted > 0 else 0.0,
             # NEW: Explicit definition of which days are in the daily P&L series
             "eligible_trading_days": eligible_trading_days_count,
-            "daily_series_definition": "Days with status in [ok, no_trades, no_watchlist]. Error days (API failures) are EXCLUDED as missing data, not treated as 0 P&L.",
+            "daily_series_definition": "Days with status in [ok, no_trades, no_watchlist]. Error days (API failures) and holidays (market closed) are EXCLUDED - not treated as 0 P&L.",
         }
 
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -313,7 +329,10 @@ class BacktestEngine:
             all_trading_days=all_trading_days,  # Include 0-trade days for consistency
         )
 
-        # Run TRUE negative controls (break signal→return structure)
+        # Run heuristic stress tests (perturb realized P&L)
+        # IMPORTANT: These are NOT true negative controls for leakage detection.
+        # They operate on already-realized P&L values, not resimulated backtests.
+        # They can detect some anomalies but CANNOT reliably detect lookahead bias.
         time_shift_result = time_shift_negative_control(
             trades_df,
             shift_minutes=5,
@@ -339,9 +358,9 @@ class BacktestEngine:
                     **bootstrap_result.to_dict(),
                 },
             },
-            # TRUE negative controls (break signal→return to detect leakage)
-            "negative_controls": {
-                "description": "Tests that break signal→return structure. If strategy still shows edge after breaking, investigate leakage.",
+            # Heuristic stress tests (NOT true negative controls)
+            "stress_tests": {
+                "description": "Heuristic tests that perturb realized P&L values. LIMITATION: These do NOT resimulate the backtest with modified entries, so they CANNOT reliably detect lookahead bias. They are useful for sanity checks but are not rigorous leakage controls.",
                 "time_shift_5min": time_shift_result.to_dict(),
                 "shuffle_dates": shuffle_result.to_dict(),
             },
@@ -497,10 +516,31 @@ class BacktestEngine:
         return df
 
     def _prev_trading_day(self, d: date) -> date:
-        """Get previous trading day (simple: skip weekends)."""
+        """
+        Get previous trading day using actual market data availability.
+
+        This handles both weekends AND market holidays correctly by checking
+        for actual data from Polygon's grouped_daily endpoint.
+        """
         prev = d - timedelta(days=1)
-        while prev.weekday() >= 5:  # Saturday=5, Sunday=6
+        max_lookback = 10  # Max days to look back (handles long holiday weekends)
+
+        for _ in range(max_lookback):
+            # Skip weekends first (cheap check)
+            while prev.weekday() >= 5:  # Saturday=5, Sunday=6
+                prev -= timedelta(days=1)
+
+            # Check if this day has actual market data
+            try:
+                data = self.polygon.grouped_daily(prev)
+                if data and len(data) > 0:
+                    return prev  # Found a valid trading day
+            except Exception:
+                pass  # API error, try previous day
+
             prev -= timedelta(days=1)
+
+        # Fallback: return the last checked day (shouldn't happen in practice)
         return prev
 
     # Trades are simulated in `strategy/ybi_small_caps.py`.

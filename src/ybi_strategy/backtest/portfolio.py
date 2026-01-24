@@ -44,6 +44,11 @@ class PortfolioPosition:
     prev_close: float | None = None
     prev_vwap: float | None = None
     prev_ema21: float | None = None
+    # CRITICAL: Track cumulative realized P&L from partial exits (scale-outs)
+    # This MUST be included in the final trade record to get correct total P&L
+    scale_pnl_realized: float = 0.0
+    # Track original entry qty for trade record (before any scale-outs)
+    original_entry_qty: float = 0.0
 
 
 @dataclass
@@ -217,20 +222,24 @@ def simulate_portfolio_day(
         qty = pp.position.qty
         record_fill(ticker, ts, "SELL", qty, exit_px, reason, signal_ts)
 
-        # Calculate P&L (includes fees)
-        pnl = (exit_px - pp.position.avg_entry) * qty - fills.fees_per_trade
+        # Calculate P&L for this final exit (NO fees here - fees applied once below)
+        final_exit_pnl = (exit_px - pp.position.avg_entry) * qty
 
-        # Update portfolio cash - MUST subtract fees to maintain ledger consistency
-        # The fee is deducted from proceeds to match the P&L calculation
+        # CRITICAL FIX: Total trade P&L = scale-out P&L + final exit P&L - fees (once)
+        # fees_per_trade is applied exactly ONCE per round-trip (not per fill)
+        total_trade_pnl = pp.scale_pnl_realized + final_exit_pnl - fills.fees_per_trade
+
+        # Update portfolio cash - add proceeds minus fees (fees only on final exit)
         portfolio.cash += (exit_px * qty - fills.fees_per_trade)
-        portfolio.realized_pnl += pnl
+        # realized_pnl tracks NET P&L (includes fee deduction for ledger consistency)
+        portfolio.realized_pnl += (final_exit_pnl - fills.fees_per_trade)
 
-        # Update risk state
+        # Update risk state with TOTAL trade P&L
         portfolio.risk_state.record_trade(
-            pnl, was_stop=(reason == "stop_hit"), exit_ts=ts.to_pydatetime()
+            total_trade_pnl, was_stop=(reason == "stop_hit"), exit_ts=ts.to_pydatetime()
         )
 
-        # Record trade
+        # Record trade with TOTAL P&L (including scale-outs)
         trades_out.append({
             "date": day.isoformat(),
             "ticker": ticker,
@@ -238,8 +247,10 @@ def simulate_portfolio_day(
             "entry_px": pp.position.avg_entry,
             "exit_ts": ts.isoformat(),
             "exit_px": exit_px,
-            "qty": qty,
-            "pnl": pnl,
+            # CRITICAL: Use original entry qty for clarity
+            "qty": pp.original_entry_qty if pp.original_entry_qty > 0 else qty,
+            # CRITICAL FIX: Total P&L includes all partial exits
+            "pnl": total_trade_pnl,
             "entry_reason": pp.position.entry_reason,
             "exit_reason": reason,
             "scaled": pp.position.scaled,
@@ -249,13 +260,41 @@ def simulate_portfolio_day(
             # Audit fields for position sizing verification
             "equity_at_entry": pp.position.equity_at_entry,
             "risk_dollars": pp.position.risk_dollars,
+            # NEW: Audit fields for P&L reconciliation
+            "scale_pnl": pp.scale_pnl_realized,
+            "final_exit_pnl": final_exit_pnl,
         })
 
-        # Reset position
+        # Reset position and scale tracking
         pp.position = Position()
+        pp.scale_pnl_realized = 0.0
+        pp.original_entry_qty = 0.0
 
-    def get_current_prices() -> dict[str, float]:
-        """Get current prices for all tickers at the current timestamp."""
+    # Track last known prices for each ticker (for when bar is missing)
+    last_known_prices: dict[str, float] = {}
+
+    def get_prices_at_open() -> dict[str, float]:
+        """
+        Get prices available at bar OPEN for mark-to-market.
+
+        CRITICAL: At bar open, we only know:
+        - The current bar's OPEN price (not close/high/low)
+        - Prior bars' prices (carried forward)
+
+        This prevents intrabar lookahead in equity/sizing calculations.
+        """
+        prices = {}
+        for ticker, df in ticker_bars.items():
+            if current_ts in df.index:
+                # Use bar OPEN - the only price known at execution time
+                prices[ticker] = float(df.loc[current_ts, "o"])
+            elif ticker in last_known_prices:
+                # Use last known price if bar is missing
+                prices[ticker] = last_known_prices[ticker]
+        return prices
+
+    def get_prices_at_close() -> dict[str, float]:
+        """Get prices at bar CLOSE (for intrabar events and end-of-bar updates)."""
         prices = {}
         for ticker, df in ticker_bars.items():
             if current_ts in df.index:
@@ -266,11 +305,12 @@ def simulate_portfolio_day(
     for current_ts in sorted_timestamps:
         bar_time = current_ts.to_pydatetime().time()
 
-        # Get current prices for all tickers
-        current_prices = get_current_prices()
+        # CRITICAL: At bar OPEN, use only prices available at open (not close)
+        prices_at_open = get_prices_at_open()
 
         # =================================================================
         # PHASE 1: Execute pending signals at this bar's OPEN
+        # CRITICAL: Use only prices available at bar open (no lookahead)
         # =================================================================
         for ticker, df in ticker_bars.items():
             if current_ts not in df.index:
@@ -290,18 +330,26 @@ def simulate_portfolio_day(
                     # Calculate position size based on risk
                     entry_px = fills.apply_entry(o)
                     stop_px = pp.pending_entry.stop_base * (1.0 - stop_buffer_pct)
-                    stop_distance = abs(entry_px - stop_px)
+
+                    # CRITICAL FIX: Stop must be BELOW entry for long trades
+                    # If stop >= entry (e.g., due to gap down), skip this entry
+                    if stop_px >= entry_px:
+                        pp.pending_entry = None
+                        continue
+
+                    stop_distance = entry_px - stop_px  # Always positive for valid long stops
 
                     if stop_distance > 0:
                         # Risk-based sizing: risk_amount / stop_distance
-                        # CRITICAL FIX: Use current (mark-to-market) equity, not starting equity
-                        current_equity = portfolio.get_equity(current_prices)
+                        # CRITICAL: Use prices_at_open (bar open) for equity calculation
+                        # This prevents intrabar lookahead
+                        current_equity = portfolio.get_equity(prices_at_open)
                         risk_amount = current_equity * risk_per_trade_pct
                         shares = risk_amount / stop_distance
 
-                        # Apply capital constraints
-                        max_value = portfolio.get_max_position_value(current_prices)
-                        available = portfolio.get_available_capital(current_prices)
+                        # Apply capital constraints using prices available at open
+                        max_value = portfolio.get_max_position_value(prices_at_open)
+                        available = portfolio.get_available_capital(prices_at_open)
                         max_shares_capital = min(max_value, available) / entry_px
 
                         qty = min(shares, max_shares_capital)
@@ -310,6 +358,9 @@ def simulate_portfolio_day(
                         # Apply starter fraction if applicable
                         if pp.pending_entry.ttm_state == "weak_bear" and allow_starter:
                             qty = qty * starter_frac
+
+                        # CRITICAL FIX: Use integer shares only (equities are not fractional)
+                        qty = int(qty)
 
                         if qty > 0:
                             cost = entry_px * qty
@@ -329,6 +380,9 @@ def simulate_portfolio_day(
                             # Record equity and risk at entry for audit trail
                             pp.position.equity_at_entry = current_equity
                             pp.position.risk_dollars = risk_amount
+                            # CRITICAL: Track original entry qty for trade record
+                            pp.original_entry_qty = qty
+                            pp.scale_pnl_realized = 0.0  # Reset scale tracking
 
                 pp.pending_entry = None
 
@@ -356,6 +410,7 @@ def simulate_portfolio_day(
 
             pp = portfolio.positions[ticker]
             row = df.loc[current_ts]
+            o = float(row["o"])
             c = float(row["c"])
             h = float(row["h"])
             l = float(row["l"])
@@ -371,24 +426,35 @@ def simulate_portfolio_day(
             if pd.notna(pmh) and c > float(pmh):
                 pp.breakout_seen = True
 
-            # Stop hit
+            # Stop hit - with gap-through-stop handling
             if pp.position.is_open() and pp.position.stop is not None and l <= pp.position.stop:
-                exit_px = fills.apply_exit(pp.position.stop)
-                close_position(ticker, pp, current_ts, exit_px, "stop_hit", signal_ts=pp.position.entry_ts)
+                # CRITICAL FIX: If bar opens BELOW stop (gap through), exit at open (worse fill)
+                # This is realistic - a stop order becomes a market order and fills at available price
+                if o <= pp.position.stop:
+                    exit_px = fills.apply_exit(o)  # Gap through - fill at open
+                    exit_reason = "stop_hit_gap_through"
+                else:
+                    exit_px = fills.apply_exit(pp.position.stop)  # Normal stop hit
+                    exit_reason = "stop_hit"
+                close_position(ticker, pp, current_ts, exit_px, exit_reason, signal_ts=pp.position.entry_ts)
                 continue
 
             # Target hit - partial scale
             if pp.position.is_open() and (not pp.position.scaled) and pp.position.target1 is not None and h >= pp.position.target1:
-                take_qty = pp.position.qty * scale_frac
+                # CRITICAL FIX: Use integer shares for scale-out
+                take_qty = int(pp.position.qty * scale_frac)
                 if take_qty > 0:
                     exit_px = fills.apply_exit(pp.position.target1)
                     record_fill(ticker, current_ts, "SELL", take_qty, exit_px,
                                 "scale_out_target1", signal_ts=pp.position.entry_ts)
-                    scale_pnl = (exit_px - pp.position.avg_entry) * take_qty - fills.fees_per_trade
-                    # Subtract fees from cash to maintain ledger consistency with P&L
-                    portfolio.cash += (exit_px * take_qty - fills.fees_per_trade)
+                    # CRITICAL FIX: Scale-out P&L has NO fees (fees applied once on final exit)
+                    scale_pnl = (exit_px - pp.position.avg_entry) * take_qty
+                    # Cash receives full proceeds (no fee deduction on partial)
+                    portfolio.cash += (exit_px * take_qty)
                     portfolio.realized_pnl += scale_pnl
                     portfolio.risk_state.record_partial_pnl(scale_pnl)
+                    # CRITICAL: Accumulate scale P&L for trade record
+                    pp.scale_pnl_realized += scale_pnl
                     pp.position.qty -= take_qty
                     pp.position.scaled = True
                     pp.position.stop = pp.position.avg_entry
@@ -533,15 +599,38 @@ def simulate_portfolio_day(
 
             update_prev()
 
+        # Update last known prices at end of each bar (for next bar's open calculations)
+        for ticker, df in ticker_bars.items():
+            if current_ts in df.index:
+                last_known_prices[ticker] = float(df.loc[current_ts, "c"])
+
     # End of day: force flat all remaining positions
-    if sorted_timestamps:
-        last_ts = sorted_timestamps[-1]
-        for ticker, pp in portfolio.positions.items():
-            if pp.position.is_open() and ticker in ticker_bars:
-                df = ticker_bars[ticker]
-                if last_ts in df.index:
-                    last_close = float(df.loc[last_ts, "c"])
-                    close_position(ticker, pp, last_ts, fills.apply_exit(last_close),
-                                   "force_flat_end_window", signal_ts=last_ts.to_pydatetime())
+    # CRITICAL FIX: Use each ticker's OWN last available timestamp, not global last_ts
+    # This ensures positions are closed even if a ticker's data ends earlier (halt, missing data)
+    for ticker, pp in portfolio.positions.items():
+        if pp.position.is_open() and ticker in ticker_bars:
+            df = ticker_bars[ticker]
+            if len(df) > 0:
+                # Use this ticker's last available bar
+                ticker_last_ts = df.index[-1]
+                last_close = float(df.loc[ticker_last_ts, "c"])
+                close_position(ticker, pp, ticker_last_ts, fills.apply_exit(last_close),
+                               "force_flat_end_window", signal_ts=ticker_last_ts.to_pydatetime())
+            elif ticker in last_known_prices:
+                # Fallback: use last known price if DataFrame is empty but we have a price
+                # Use the global last timestamp for the exit record
+                if sorted_timestamps:
+                    fallback_ts = sorted_timestamps[-1]
+                    close_position(ticker, pp, fallback_ts, fills.apply_exit(last_known_prices[ticker]),
+                                   "force_flat_end_window_fallback", signal_ts=fallback_ts.to_pydatetime())
+
+    # INVARIANT CHECK: No open positions should remain after force-flat
+    open_positions = [(t, pp) for t, pp in portfolio.positions.items() if pp.position.is_open()]
+    if open_positions:
+        tickers_open = [t for t, _ in open_positions]
+        raise RuntimeError(
+            f"INVARIANT VIOLATION: {len(open_positions)} position(s) still open after force-flat: {tickers_open}. "
+            "This indicates missing price data for these tickers."
+        )
 
     return fills_out, trades_out, portfolio

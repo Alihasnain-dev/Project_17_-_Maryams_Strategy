@@ -80,3 +80,19 @@ class PolygonClient:
         if not isinstance(results, list) or not results:
             return None
         return results[0]
+
+    def ticker_details(self, ticker: str) -> dict[str, Any] | None:
+        """
+        Fetch ticker reference data for asset type classification.
+
+        Returns dict with fields like:
+        - type: "CS" (common stock), "ETF", "WARRANT", etc.
+        - market: "stocks", "otc", etc.
+        - active: True/False
+        """
+        try:
+            path = f"/v3/reference/tickers/{ticker}"
+            data = self._get(path)
+            return data.get("results", None)
+        except PolygonError:
+            return None

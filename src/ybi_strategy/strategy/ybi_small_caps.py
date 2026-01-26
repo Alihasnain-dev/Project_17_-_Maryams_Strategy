@@ -112,8 +112,35 @@ class DayRiskState:
 
         return True, ""
 
+    def record_entry(self) -> None:
+        """
+        Record a new trade ENTRY.
+
+        CRITICAL: Trade count must be incremented at ENTRY time, not exit time.
+        This prevents opening more than max_trades concurrent positions before
+        any of them close.
+        """
+        self.trade_count += 1
+
+    def record_exit(self, pnl: float, was_stop: bool, exit_ts: datetime) -> None:
+        """
+        Record a trade EXIT (close).
+
+        NOTE: Trade count is NOT incremented here - it was already counted at entry.
+        This method only records P&L and cooldown state.
+        """
+        self.realized_pnl += pnl
+        if was_stop:
+            self.last_stop_ts = exit_ts
+
     def record_trade(self, pnl: float, was_stop: bool, exit_ts: datetime) -> None:
-        """Record a completed trade."""
+        """
+        DEPRECATED: Use record_entry() at entry and record_exit() at exit.
+
+        This method is kept for backwards compatibility with legacy code paths
+        that open and close in the same call. It increments trade_count, which
+        is WRONG for portfolio mode with concurrent positions.
+        """
         self.trade_count += 1
         self.realized_pnl += pnl
         if was_stop:

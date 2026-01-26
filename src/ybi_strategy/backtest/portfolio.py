@@ -235,8 +235,11 @@ def simulate_portfolio_day(
         portfolio.realized_pnl += (final_exit_pnl - fills.fees_per_trade)
 
         # Update risk state with TOTAL trade P&L
-        portfolio.risk_state.record_trade(
-            total_trade_pnl, was_stop=(reason == "stop_hit"), exit_ts=ts.to_pydatetime()
+        # CRITICAL FIX: Use record_exit (not record_trade) - trade count already incremented at entry
+        # CRITICAL FIX: Any stop reason triggers cooldown (stop_hit, stop_hit_gap_through, etc.)
+        was_stop = reason.startswith("stop_hit")
+        portfolio.risk_state.record_exit(
+            total_trade_pnl, was_stop=was_stop, exit_ts=ts.to_pydatetime()
         )
 
         # Record trade with TOTAL P&L (including scale-outs)
@@ -371,6 +374,11 @@ def simulate_portfolio_day(
                                 f"{pp.pending_entry.reason}|ttm={pp.pending_entry.ttm_state}",
                                 signal_ts=pp.pending_entry.signal_ts,
                             )
+
+                            # CRITICAL FIX: Count trade at ENTRY time, not exit time
+                            # This prevents opening more than max_trades concurrent positions
+                            portfolio.risk_state.record_entry()
+
                             pp.position.add(qty, entry_px)
                             pp.position.entry_ts = current_ts.to_pydatetime()
                             pp.position.signal_ts = pp.pending_entry.signal_ts

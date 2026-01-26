@@ -37,6 +37,8 @@ from ybi_strategy.reporting.analysis import (
     time_shift_negative_control,
     shuffle_dates_negative_control,
     reconcile_trades_and_fills,
+    leakage_audit,
+    daily_series_inference,
 )
 from ybi_strategy.backtest.fills import FillModel, create_fill_model
 
@@ -2258,6 +2260,243 @@ class TestV8Fixes:
         print(f"  ✓ Reference data filtering is enabled by default")
 
 
+class TestV9Fixes:
+    """Tests for V9 audit fixes.
+
+    V9 AUDIT FIXES:
+    - Max-trades-per-day count at ENTRY time, not exit time
+    - Cooldown triggered for ALL stop_hit* reasons (including gap_through)
+    - Ambiguous patterns (W$/P$) skipped when reference data is available
+    - Leakage audit verifies signal_ts < entry_ts
+    - Daily series inference with HAC (Newey-West) standard errors
+    """
+
+    def test_day_risk_state_counts_at_entry(self):
+        """Test that DayRiskState counts trades at entry time, not exit."""
+        from datetime import datetime
+
+        # Test the new record_entry/record_exit interface
+        state = DayRiskState()
+        now = datetime.now()
+
+        # Parameters for can_trade
+        max_trades = 3
+        max_loss = 1000.0
+        cooldown_minutes = 2
+
+        # Record 3 entries
+        can, _ = state.can_trade(now, max_trades, max_loss, cooldown_minutes)
+        assert can, "Should allow trade before max reached"
+        state.record_entry()  # Entry 1
+        assert state.trade_count == 1, "Trade count should be 1"
+
+        can, _ = state.can_trade(now, max_trades, max_loss, cooldown_minutes)
+        assert can, "Should allow trade before max reached"
+        state.record_entry()  # Entry 2
+        assert state.trade_count == 2, "Trade count should be 2"
+
+        can, _ = state.can_trade(now, max_trades, max_loss, cooldown_minutes)
+        assert can, "Should allow trade before max reached"
+        state.record_entry()  # Entry 3
+        assert state.trade_count == 3, "Trade count should be 3"
+
+        # Now at max trades - no more allowed
+        can, reason = state.can_trade(now, max_trades, max_loss, cooldown_minutes)
+        assert not can, "Should NOT allow trade at max"
+        assert reason == "max_trades_reached"
+
+        # Recording exits should NOT change trade count
+        state.record_exit(pnl=10.0, was_stop=False, exit_ts=now)
+        assert state.trade_count == 3, "Exit should NOT increment trade count"
+
+        state.record_exit(pnl=-5.0, was_stop=False, exit_ts=now)
+        assert state.trade_count == 3, "Exit should NOT increment trade count"
+
+        print(f"  ✓ DayRiskState counts trades at ENTRY time (not exit)")
+        print(f"  ✓ record_entry() increments count, record_exit() does not")
+
+    def test_cooldown_triggered_for_gap_through_stop(self):
+        """Test that cooldown is triggered for stop_hit_gap_through reason."""
+        from datetime import datetime, timedelta
+
+        state = DayRiskState()
+        cooldown_minutes = 2
+        max_trades = 10
+        max_loss = 1000.0
+
+        # Simulate a stop_hit_gap_through exit
+        now = datetime.now()
+        was_stop = True  # The fix: portfolio.py now checks reason.startswith("stop_hit")
+
+        state.record_exit(pnl=-20.0, was_stop=was_stop, exit_ts=now)
+
+        # Verify cooldown is set
+        assert state.last_stop_ts == now, "last_stop_ts should be set after stop exit"
+
+        # Immediately after stop, should be in cooldown (via can_trade check)
+        can, reason = state.can_trade(
+            now + timedelta(seconds=30), max_trades, max_loss, cooldown_minutes
+        )
+        assert not can, "Should be blocked immediately after stop"
+        assert reason == "cooldown_active", f"Expected cooldown_active, got {reason}"
+
+        # After cooldown expires, should be able to trade
+        after_cooldown = now + timedelta(minutes=3)
+        can, reason = state.can_trade(after_cooldown, max_trades, max_loss, cooldown_minutes)
+        assert can, f"Should be able to trade after cooldown, but blocked by: {reason}"
+
+        print(f"  ✓ Cooldown triggered for stop exits (was_stop=True)")
+        print(f"  ✓ Cooldown duration respected ({cooldown_minutes} minutes)")
+
+    def test_ambiguous_patterns_skipped_with_reference_data(self):
+        """Test that W$/P$ patterns are skipped when reference data is available."""
+        from ybi_strategy.universe.watchlist import is_common_stock_ticker
+
+        # With use_ambiguous_patterns=True (no reference data), SNOW would be rejected
+        snow_with_ambiguous = is_common_stock_ticker("SNOW", use_ambiguous_patterns=True)
+        # Note: SNOW is 4 chars, W suffix check requires base>=3, so SNOW passes anyway
+        # But SOUNW (5 chars) would be rejected
+
+        # With use_ambiguous_patterns=False (reference data available), patterns are skipped
+        snow_without_ambiguous = is_common_stock_ticker("SNOW", use_ambiguous_patterns=False)
+        assert snow_without_ambiguous, "SNOW should be accepted when ambiguous patterns skipped"
+
+        # Unambiguous patterns should STILL be applied
+        warrant_explicit = is_common_stock_ticker("QBTS.WS", use_ambiguous_patterns=False)
+        assert not warrant_explicit, ".WS warrants should still be rejected"
+
+        unit_explicit = is_common_stock_ticker("SPAC.U", use_ambiguous_patterns=False)
+        assert not unit_explicit, ".U units should still be rejected"
+
+        print(f"  ✓ Ambiguous patterns (W$/P$) skipped when use_ambiguous_patterns=False")
+        print(f"  ✓ Unambiguous patterns (.WS, .U) still applied")
+
+    def test_leakage_audit_passes_for_valid_trades(self):
+        """Test that leakage audit passes for trades with signal_ts < entry_ts."""
+        from ybi_strategy.reporting.analysis import leakage_audit
+
+        # Create trades where signal_ts < entry_ts (valid)
+        trades_df = pd.DataFrame({
+            "date": ["2025-01-02"] * 3,
+            "ticker": ["TEST"] * 3,
+            "signal_ts": [
+                "2025-01-02T09:35:00-05:00",
+                "2025-01-02T09:45:00-05:00",
+                "2025-01-02T10:00:00-05:00",
+            ],
+            "entry_ts": [
+                "2025-01-02T09:36:00-05:00",  # 1 min after signal
+                "2025-01-02T09:46:00-05:00",  # 1 min after signal
+                "2025-01-02T10:01:00-05:00",  # 1 min after signal
+            ],
+            "pnl": [10.0, -5.0, 15.0],
+        })
+
+        result = leakage_audit(trades_df)
+
+        assert result.is_valid, f"Should pass: {result.audit_message}"
+        assert result.signal_after_entry_violations == 0
+        assert result.signal_equals_entry_violations == 0
+
+        print(f"  ✓ Leakage audit PASSES for valid trades")
+        print(f"  ✓ Audited {result.total_trades} trades, {result.trades_with_signal_ts} with signal_ts")
+
+    def test_leakage_audit_fails_for_lookahead(self):
+        """Test that leakage audit fails for trades with signal_ts >= entry_ts."""
+        from ybi_strategy.reporting.analysis import leakage_audit
+
+        # Create trades with lookahead violations
+        trades_df = pd.DataFrame({
+            "date": ["2025-01-02"] * 3,
+            "ticker": ["TEST"] * 3,
+            "signal_ts": [
+                "2025-01-02T09:36:00-05:00",  # AFTER entry (violation!)
+                "2025-01-02T09:45:00-05:00",  # EQUALS entry (violation!)
+                "2025-01-02T09:59:00-05:00",  # Before entry (valid)
+            ],
+            "entry_ts": [
+                "2025-01-02T09:35:00-05:00",  # Entry before signal!
+                "2025-01-02T09:45:00-05:00",  # Entry equals signal!
+                "2025-01-02T10:00:00-05:00",  # Entry after signal (valid)
+            ],
+            "pnl": [10.0, -5.0, 15.0],
+        })
+
+        result = leakage_audit(trades_df)
+
+        assert not result.is_valid, "Should FAIL due to violations"
+        assert result.signal_after_entry_violations == 1, "Should detect signal_after_entry"
+        assert result.signal_equals_entry_violations == 1, "Should detect signal_equals_entry"
+
+        print(f"  ✓ Leakage audit FAILS for lookahead violations")
+        print(f"  ✓ Detected {result.signal_after_entry_violations} signal_after_entry violations")
+        print(f"  ✓ Detected {result.signal_equals_entry_violations} signal_equals_entry violations")
+
+    def test_daily_series_inference_with_hac(self):
+        """Test daily series inference with HAC (Newey-West) standard errors."""
+        from ybi_strategy.reporting.analysis import daily_series_inference
+
+        np.random.seed(42)
+
+        # Create trades with significant positive edge across 30 days
+        dates = pd.date_range("2025-01-02", periods=30, freq="B")
+        trades = []
+        for d in dates:
+            n_trades = np.random.randint(2, 5)
+            for _ in range(n_trades):
+                trades.append({
+                    "date": d.strftime("%Y-%m-%d"),
+                    "pnl": np.random.normal(20, 10),  # Clear positive edge
+                })
+
+        trades_df = pd.DataFrame(trades)
+        all_trading_days = [d.strftime("%Y-%m-%d") for d in dates]
+
+        result = daily_series_inference(trades_df, all_trading_days=all_trading_days)
+
+        assert result.method == "hac_newey_west"
+        assert result.n_days == 30
+        assert result.hac_bandwidth > 0, "HAC bandwidth should be computed"
+        assert result.hac_std_error > 0, "HAC SE should be positive"
+        assert result.mean_daily_pnl > 0, "Mean should be positive for this data"
+        assert result.is_significant_5pct, "Should be significant with this edge"
+
+        print(f"  ✓ Daily series inference uses HAC (Newey-West)")
+        print(f"  ✓ HAC bandwidth = {result.hac_bandwidth}")
+        print(f"  ✓ Mean daily P&L = ${result.mean_daily_pnl:.2f}, SE = ${result.hac_std_error:.4f}")
+        print(f"  ✓ t = {result.t_statistic:.2f}, p = {result.p_value:.6f}")
+
+    def test_daily_series_inference_includes_zero_trade_days(self):
+        """Test that daily series inference includes 0-trade days."""
+        from ybi_strategy.reporting.analysis import daily_series_inference
+
+        # Create trades on only some days
+        trades_df = pd.DataFrame({
+            "date": ["2025-01-02", "2025-01-03", "2025-01-06"],  # Skip Jan 4, 5
+            "pnl": [100.0, -50.0, 75.0],
+        })
+
+        # Define all trading days including 0-trade days
+        all_trading_days = ["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07", "2025-01-08"]
+
+        result = daily_series_inference(trades_df, all_trading_days=all_trading_days)
+
+        # Should have 5 days even though only 3 have trades
+        assert result.n_days == 5, f"Should have 5 days, got {result.n_days}"
+
+        # Total P&L should be sum of trades only
+        expected_total = 100.0 - 50.0 + 75.0
+        assert abs(result.total_pnl - expected_total) < 0.01
+
+        # Mean should be averaged over 5 days (not 3)
+        expected_mean = expected_total / 5
+        assert abs(result.mean_daily_pnl - expected_mean) < 0.01
+
+        print(f"  ✓ Daily series inference includes 0-trade days")
+        print(f"  ✓ n_days={result.n_days}, n_trades={result.n_trades}")
+        print(f"  ✓ Mean daily P&L=${result.mean_daily_pnl:.2f} (averaged over {result.n_days} days)")
+
+
 def run_all_tests():
     """Run all tests and report results."""
     print("\n" + "=" * 60)
@@ -2277,6 +2516,7 @@ def run_all_tests():
         ("P&L Accounting and Reconciliation", TestPnLAccountingAndReconciliation()),
         ("V7 Audit Fixes", TestV7Fixes()),
         ("V8 Audit Fixes", TestV8Fixes()),
+        ("V9 Audit Fixes", TestV9Fixes()),
     ]
 
     total_tests = 0

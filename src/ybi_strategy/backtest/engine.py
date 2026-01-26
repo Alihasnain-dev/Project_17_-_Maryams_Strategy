@@ -32,6 +32,8 @@ from ybi_strategy.reporting.analysis import (
     block_bootstrap_test,
     time_shift_negative_control,
     shuffle_dates_negative_control,
+    leakage_audit,
+    daily_series_inference,
 )
 
 
@@ -345,6 +347,16 @@ class BacktestEngine:
             random_seed=self.MONTE_CARLO_SEED,
         )
 
+        # Run leakage audit - verifies signal_ts < entry_ts for all trades
+        leakage_result = leakage_audit(trades_df)
+
+        # Run daily series inference with HAC (Newey-West) standard errors
+        # This is the PRIMARY inference method that accounts for autocorrelation
+        hac_inference_result = daily_series_inference(
+            trades_df,
+            all_trading_days=all_trading_days,
+        )
+
         return {
             "metrics": metrics.to_dict(),
             "stratified_analysis": strat_analysis.to_dict(),
@@ -352,11 +364,20 @@ class BacktestEngine:
             "walk_forward": wf_result.to_dict(),
             # Statistical inference (hypothesis tests)
             "statistical_inference": {
+                "daily_series_hac": {
+                    "description": "PRIMARY inference method using HAC (Newey-West) standard errors to account for autocorrelation in daily returns.",
+                    **hac_inference_result.to_dict(),
+                },
                 "bootstrap_mean_test": {
                     "description": "Day-level block bootstrap testing H0: E[daily P&L] = 0. This is a HYPOTHESIS TEST for edge detection, not a leakage control.",
                     "note": "observed_mean_daily_pnl should match metrics.mean_daily_pnl (same day set)",
                     **bootstrap_result.to_dict(),
                 },
+            },
+            # Leakage audit - MUST pass for valid backtest
+            "leakage_audit": {
+                "description": "Verifies signal_ts < entry_ts for all trades. ANY violations indicate potential lookahead bias.",
+                **leakage_result.to_dict(),
             },
             # Heuristic stress tests (NOT true negative controls)
             "stress_tests": {

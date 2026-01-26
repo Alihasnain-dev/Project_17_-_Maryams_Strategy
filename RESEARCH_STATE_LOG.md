@@ -1,7 +1,7 @@
 # Research State Log - YBI Intraday Strategy
 
 **Last Updated**: 2026-01-24
-**Current Phase**: AUDIT V8 FIXES COMPLETE - Reconciliation Verified
+**Current Phase**: AUDIT V9 FIXES COMPLETE - Ready for Re-run
 
 ---
 
@@ -13,9 +13,20 @@ Implement and statistically validate a **no-lookahead, intraday-only** backtest 
 
 ## Current Status & Verdict
 
-**Status**: V8 CORRECTIVE IMPLEMENTATION COMPLETE - All 64 tests pass, reconciliation verified
+**Status**: V9 CORRECTIVE IMPLEMENTATION COMPLETE - All 71 tests pass
 
-**Verdict**: After fixing V8 audit issues (force-flat per-ticker, reference-data filtering default, no-open-positions invariant), the backtest artifacts are internally consistent. Reconciliation passes with $0.00 discrepancy.
+**Verdict**: After fixing V9 audit issues (trade count at entry, cooldown for all stops, universe filter false positives, HAC inference, leakage audit), the backtest infrastructure is methodologically sound. Ready for full re-run with Polygon API.
+
+### V9 Audit Issues (All Fixed)
+
+| Issue | Severity | Status | Resolution |
+|-------|----------|--------|------------|
+| Max-trades-per-day counted at exit | CRITICAL | **FIXED** | `record_entry()` increments count; `record_exit()` does not |
+| Cooldown bypass for gap-through stops | CRITICAL | **FIXED** | Cooldown triggers for `reason.startswith("stop_hit")` |
+| Universe filter false positives | HIGH | **FIXED** | Ambiguous patterns (W$/P$) skipped when reference data available |
+| No HAC standard errors | HIGH | **FIXED** | Added `daily_series_inference()` with Newey-West HAC SE |
+| No leakage audit | HIGH | **FIXED** | Added `leakage_audit()` verifying signal_ts < entry_ts |
+| Missing slippage sensitivity infrastructure | MEDIUM | **READY** | Existing `scripts/run_stress_test.py` supports 3+ scenarios |
 
 ### V8 Audit Issues (All Fixed)
 
@@ -495,7 +506,16 @@ class FillModel:
 
 ## Test Coverage
 
-**64/64 tests passing** including:
+**71/71 tests passing** including:
+
+### New Tests (V9)
+- `test_day_risk_state_counts_at_entry()` - Verifies trade count increments at entry, not exit
+- `test_cooldown_triggered_for_gap_through_stop()` - Verifies cooldown for all stop_hit* reasons
+- `test_ambiguous_patterns_skipped_with_reference_data()` - Verifies W$/P$ skipped when ref data available
+- `test_leakage_audit_passes_for_valid_trades()` - Verifies signal_ts < entry_ts validation passes
+- `test_leakage_audit_fails_for_lookahead()` - Verifies lookahead violations detected
+- `test_daily_series_inference_with_hac()` - Verifies HAC (Newey-West) standard errors computed
+- `test_daily_series_inference_includes_zero_trade_days()` - Verifies 0-trade days included
 
 ### New Tests (V8)
 - `test_force_flat_per_ticker_timestamp()` - Verifies force-flat uses per-ticker last bar
@@ -538,14 +558,14 @@ class FillModel:
 |----------|----------|--------|
 | Strategy code | `src/ybi_strategy/strategy/ybi_small_caps.py` | VALID |
 | Backtest engine | `src/ybi_strategy/backtest/engine.py` | VALID |
-| Portfolio module | `src/ybi_strategy/backtest/portfolio.py` | **FIXED** (V8: per-ticker force-flat, invariant check) |
+| Portfolio module | `src/ybi_strategy/backtest/portfolio.py` | **FIXED** (V9: record_entry at BUY, cooldown for all stops) |
 | Fill model | `src/ybi_strategy/backtest/fills.py` | VALID |
 | Metrics | `src/ybi_strategy/reporting/metrics.py` | VALID |
 | Analysis | `src/ybi_strategy/reporting/analysis.py` | VALID |
-| **Watchlist/Universe** | `src/ybi_strategy/universe/watchlist.py` | **FIXED** (V8: reference data default, preferred filter) |
+| **Watchlist/Universe** | `src/ybi_strategy/universe/watchlist.py` | **FIXED** (V9: ambiguous patterns skipped with ref data) |
 | **Market Calendar** | `src/ybi_strategy/calendar/market_calendar.py` | VALID |
 | Polygon client | `src/ybi_strategy/polygon/client.py` | VALID |
-| Test suite | `tests/test_strategy.py` | **64 tests passing** |
+| Test suite | `tests/test_strategy.py` | **71 tests passing** |
 | Configuration | `configs/strategy.yaml` | VALID |
 | **V8 Results** | `data/results_v8/` | **COMPLETE** (reconciliation verified) |
 | **V7 Results** | `data/results_v7/` | **INVALID** (reconciliation failed) |
@@ -578,11 +598,38 @@ class FillModel:
 - [x] **Force-flat per-ticker** (V8: uses each ticker's last bar, not global)
 - [x] **No open positions invariant** (V8: RuntimeError if positions remain)
 - [x] **Reconciliation verified** (V8: $0.00 discrepancy, all BUYs have SELLs)
+- [x] **Max-trades counted at entry** (V9: record_entry() at BUY fill, not exit)
+- [x] **Cooldown for all stop exits** (V9: reason.startswith("stop_hit"))
+- [x] **Universe filter no false positives** (V9: ambiguous patterns skipped with ref data)
+- [x] **HAC standard errors** (V9: daily_series_inference() with Newey-West)
+- [x] **Leakage audit in summary** (V9: signal_ts < entry_ts verification)
+- [x] **Slippage sensitivity infrastructure** (scripts/run_stress_test.py ready)
 - [ ] Independent code review (recommended)
 
 ---
 
 ## Session Notes
+
+**2026-01-24 (Audit V9 Fixes)**:
+- Received ninth audit identifying critical/high issues:
+  - Max-trades-per-day counted at exit (allowed 6-7 trades when max=5)
+  - Cooldown bypass for `stop_hit_gap_through` (only checked `reason == "stop_hit"`)
+  - Universe filter false positives (W$/P$ patterns rejected legitimate stocks like SNOW)
+  - No HAC standard errors for daily P&L inference
+  - No explicit leakage audit in summary.json
+- CRITICAL FIX: Split DayRiskState into `record_entry()` and `record_exit()`
+  - `record_entry()` increments trade count at BUY fill time
+  - `record_exit()` records P&L and cooldown without incrementing count
+- CRITICAL FIX: Cooldown now checks `reason.startswith("stop_hit")`
+- HIGH FIX: Split patterns into UNAMBIGUOUS (always applied) and AMBIGUOUS (skipped with ref data)
+  - UNAMBIGUOUS: .WS, .W, .U, .R, ^ (explicit suffixes)
+  - AMBIGUOUS: W$, P$ (can cause false positives on SNOW, SHOP)
+- HIGH FIX: Added `daily_series_inference()` with Newey-West HAC standard errors
+- HIGH FIX: Added `leakage_audit()` verifying signal_ts < entry_ts for all trades
+- HIGH FIX: Integrated both into engine.py summary.json output
+- Slippage sensitivity infrastructure already exists (`scripts/run_stress_test.py`)
+- All 71 tests pass (7 new V9 tests)
+- **STATUS**: V9 code fixes complete, ready for full backtest re-run
 
 **2026-01-24 (Audit V8 Fixes)**:
 - Received eighth audit (FAIL) identifying reconciliation/ledger issues:

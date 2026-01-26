@@ -1294,3 +1294,385 @@ def reconcile_trades_and_fills(
     )
 
     return result
+
+
+# =============================================================================
+# LEAKAGE AUDIT
+# =============================================================================
+
+@dataclass
+class LeakageAuditResult:
+    """
+    Results from leakage audit verifying no lookahead bias.
+
+    For a valid backtest, ALL trades must satisfy:
+    - signal_ts < entry_ts (signal must precede entry)
+    - entry occurs at next bar open (not same bar as signal)
+    """
+    total_trades: int = 0
+    trades_with_signal_ts: int = 0
+    trades_with_entry_ts: int = 0
+
+    # Violation counts (must be zero for valid backtest)
+    signal_after_entry_violations: int = 0
+    signal_equals_entry_violations: int = 0
+    same_bar_fill_violations: int = 0
+
+    # Details of violations (if any)
+    violation_details: list[dict[str, Any]] = field(default_factory=list)
+
+    # Overall pass/fail
+    is_valid: bool = False
+    audit_message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "total_trades": self.total_trades,
+            "trades_with_signal_ts": self.trades_with_signal_ts,
+            "trades_with_entry_ts": self.trades_with_entry_ts,
+            "signal_after_entry_violations": self.signal_after_entry_violations,
+            "signal_equals_entry_violations": self.signal_equals_entry_violations,
+            "same_bar_fill_violations": self.same_bar_fill_violations,
+            "total_violations": (
+                self.signal_after_entry_violations +
+                self.signal_equals_entry_violations +
+                self.same_bar_fill_violations
+            ),
+            "is_valid": self.is_valid,
+            "audit_message": self.audit_message,
+            "violation_details": self.violation_details[:10],  # Limit to first 10
+        }
+
+
+def leakage_audit(trades_df: pd.DataFrame) -> LeakageAuditResult:
+    """
+    Audit trades for lookahead bias (leakage).
+
+    Verifies that for ALL trades:
+    1. signal_ts < entry_ts (signal must strictly precede entry)
+    2. Entries occur at the next bar open, not on the signal bar
+
+    Args:
+        trades_df: DataFrame with 'signal_ts' and 'entry_ts' columns.
+
+    Returns:
+        LeakageAuditResult with violation counts and pass/fail status.
+    """
+    result = LeakageAuditResult()
+    result.total_trades = len(trades_df)
+
+    if trades_df.empty:
+        result.is_valid = True
+        result.audit_message = "No trades to audit"
+        return result
+
+    # Check for required columns
+    has_signal_ts = "signal_ts" in trades_df.columns
+    has_entry_ts = "entry_ts" in trades_df.columns
+
+    if not has_signal_ts or not has_entry_ts:
+        result.is_valid = False
+        result.audit_message = f"Missing required columns: signal_ts={has_signal_ts}, entry_ts={has_entry_ts}"
+        return result
+
+    # Parse timestamps
+    for idx, row in trades_df.iterrows():
+        signal_ts = row.get("signal_ts")
+        entry_ts = row.get("entry_ts")
+
+        if pd.notna(signal_ts):
+            result.trades_with_signal_ts += 1
+        if pd.notna(entry_ts):
+            result.trades_with_entry_ts += 1
+
+        if pd.isna(signal_ts) or pd.isna(entry_ts):
+            continue
+
+        # Parse timestamps
+        try:
+            if isinstance(signal_ts, str):
+                signal_dt = pd.Timestamp(signal_ts)
+            else:
+                signal_dt = pd.Timestamp(signal_ts)
+
+            if isinstance(entry_ts, str):
+                entry_dt = pd.Timestamp(entry_ts)
+            else:
+                entry_dt = pd.Timestamp(entry_ts)
+        except Exception:
+            continue
+
+        # Check for violations
+        if signal_dt > entry_dt:
+            result.signal_after_entry_violations += 1
+            result.violation_details.append({
+                "type": "signal_after_entry",
+                "date": row.get("date"),
+                "ticker": row.get("ticker"),
+                "signal_ts": str(signal_ts),
+                "entry_ts": str(entry_ts),
+            })
+        elif signal_dt == entry_dt:
+            result.signal_equals_entry_violations += 1
+            result.violation_details.append({
+                "type": "signal_equals_entry",
+                "date": row.get("date"),
+                "ticker": row.get("ticker"),
+                "signal_ts": str(signal_ts),
+                "entry_ts": str(entry_ts),
+            })
+
+    # Determine overall validity
+    total_violations = (
+        result.signal_after_entry_violations +
+        result.signal_equals_entry_violations +
+        result.same_bar_fill_violations
+    )
+
+    result.is_valid = total_violations == 0
+
+    if result.is_valid:
+        result.audit_message = (
+            f"PASS: All {result.trades_with_signal_ts} trades have signal_ts < entry_ts. "
+            "No lookahead bias detected."
+        )
+    else:
+        result.audit_message = (
+            f"FAIL: {total_violations} violations detected. "
+            f"signal_after_entry={result.signal_after_entry_violations}, "
+            f"signal_equals_entry={result.signal_equals_entry_violations}. "
+            "This indicates potential lookahead bias."
+        )
+
+    return result
+
+
+# =============================================================================
+# DAILY SERIES INFERENCE WITH HAC STANDARD ERRORS
+# =============================================================================
+
+@dataclass
+class DailySeriesInferenceResult:
+    """
+    Results from daily P&L inference with HAC (Newey-West) standard errors.
+
+    This provides robust standard errors that account for autocorrelation
+    in daily returns, which is more appropriate than assuming i.i.d.
+    """
+    method: str = "hac_newey_west"
+    n_days: int = 0
+    n_trades: int = 0
+
+    # Point estimates
+    mean_daily_pnl: float = 0.0
+    total_pnl: float = 0.0
+    std_daily_pnl: float = 0.0
+
+    # HAC standard error
+    hac_std_error: float = 0.0
+    hac_bandwidth: int = 0  # Newey-West lag truncation
+
+    # Inference
+    t_statistic: float = 0.0
+    p_value: float = 1.0
+    ci_lower_95: float = 0.0
+    ci_upper_95: float = 0.0
+
+    # Significance flags
+    is_significant_5pct: bool = False
+    is_significant_1pct: bool = False
+
+    # Sample adequacy
+    insufficient_sample: bool = False
+    sample_size_warning: str = ""
+
+    # Interpretation
+    interpretation: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "method": self.method,
+            "description": (
+                "Daily P&L inference with HAC (Newey-West) standard errors. "
+                "Accounts for autocorrelation in daily returns. "
+                "More robust than assuming i.i.d. trades."
+            ),
+            "n_days": self.n_days,
+            "n_trades": self.n_trades,
+            "mean_daily_pnl": round(self.mean_daily_pnl, 4),
+            "total_pnl": round(self.total_pnl, 2),
+            "std_daily_pnl": round(self.std_daily_pnl, 4),
+            "hac_std_error": round(self.hac_std_error, 4),
+            "hac_bandwidth": self.hac_bandwidth,
+            "t_statistic": round(self.t_statistic, 4),
+            "p_value": f"{self.p_value:.6e}" if self.p_value < 1e-4 else round(self.p_value, 6),
+            "p_value_numeric": self.p_value,
+            "ci_lower_95": round(self.ci_lower_95, 4),
+            "ci_upper_95": round(self.ci_upper_95, 4),
+            "is_significant_5pct": bool(self.is_significant_5pct),
+            "is_significant_1pct": bool(self.is_significant_1pct),
+            "insufficient_sample": self.insufficient_sample,
+            "sample_size_warning": self.sample_size_warning,
+            "interpretation": self.interpretation,
+        }
+
+
+def _newey_west_se(residuals: np.ndarray, bandwidth: int | None = None) -> float:
+    """
+    Compute Newey-West HAC standard error for mean estimation.
+
+    Args:
+        residuals: Array of residuals (daily returns centered at zero).
+        bandwidth: Lag truncation parameter. If None, uses floor(4*(n/100)^(2/9)).
+
+    Returns:
+        HAC standard error of the mean.
+    """
+    n = len(residuals)
+    if n < 2:
+        return 0.0
+
+    # Default bandwidth: Newey-West rule of thumb
+    if bandwidth is None:
+        bandwidth = int(np.floor(4 * (n / 100) ** (2 / 9)))
+        bandwidth = max(1, min(bandwidth, n - 1))
+
+    # Compute autocovariances
+    gamma = np.zeros(bandwidth + 1)
+    for j in range(bandwidth + 1):
+        gamma[j] = np.mean(residuals[j:] * residuals[:n - j]) if j < n else 0.0
+
+    # Newey-West weighted sum
+    nw_var = gamma[0]
+    for j in range(1, bandwidth + 1):
+        weight = 1 - j / (bandwidth + 1)  # Bartlett kernel
+        nw_var += 2 * weight * gamma[j]
+
+    # Standard error of mean
+    se = np.sqrt(nw_var / n)
+    return float(se)
+
+
+def daily_series_inference(
+    trades_df: pd.DataFrame,
+    all_trading_days: list[str] | None = None,
+    min_days_threshold: int = 20,
+) -> DailySeriesInferenceResult:
+    """
+    Perform inference on daily P&L using HAC (Newey-West) standard errors.
+
+    This is the PRIMARY inference method for strategy evaluation. It:
+    1. Computes daily P&L (including 0-trade days)
+    2. Uses Newey-West HAC standard errors to account for autocorrelation
+    3. Computes t-statistic and p-value for H0: E[daily P&L] = 0
+
+    Args:
+        trades_df: DataFrame with 'pnl' and 'date' columns.
+        all_trading_days: List of all trading days (YYYY-MM-DD strings).
+            If provided, 0-trade days are included with P&L=0.
+        min_days_threshold: Minimum days required for inference.
+
+    Returns:
+        DailySeriesInferenceResult with robust inference statistics.
+    """
+    result = DailySeriesInferenceResult()
+
+    # Handle empty inputs
+    if trades_df.empty and (all_trading_days is None or len(all_trading_days) == 0):
+        result.insufficient_sample = True
+        result.sample_size_warning = "No trades and no trading days"
+        return result
+
+    result.n_trades = len(trades_df)
+
+    # Build daily P&L series
+    if all_trading_days is not None and len(all_trading_days) > 0:
+        all_days_index = pd.Index(all_trading_days, name="date")
+        daily_pnl_series = pd.Series(0.0, index=all_days_index)
+
+        if not trades_df.empty:
+            daily_pnl_with_trades = trades_df.groupby("date")["pnl"].sum()
+            for dt in daily_pnl_with_trades.index:
+                if dt in daily_pnl_series.index:
+                    daily_pnl_series[dt] = daily_pnl_with_trades[dt]
+
+        daily_pnl = daily_pnl_series.values
+    else:
+        daily_pnl = trades_df.groupby("date")["pnl"].sum().values
+
+    n_days = len(daily_pnl)
+    result.n_days = n_days
+
+    if n_days < min_days_threshold:
+        result.insufficient_sample = True
+        result.sample_size_warning = f"Insufficient days for inference (N={n_days} < {min_days_threshold})"
+
+    if n_days < 5:
+        result.sample_size_warning = "Too few days for meaningful inference"
+        return result
+
+    # Point estimates
+    mean_pnl = float(np.mean(daily_pnl))
+    std_pnl = float(np.std(daily_pnl, ddof=1))
+    total_pnl = float(np.sum(daily_pnl))
+
+    result.mean_daily_pnl = mean_pnl
+    result.std_daily_pnl = std_pnl
+    result.total_pnl = total_pnl
+
+    # Compute HAC standard error (Newey-West)
+    residuals = daily_pnl - mean_pnl
+    bandwidth = int(np.floor(4 * (n_days / 100) ** (2 / 9)))
+    bandwidth = max(1, min(bandwidth, n_days - 1))
+    result.hac_bandwidth = bandwidth
+
+    hac_se = _newey_west_se(residuals, bandwidth)
+    result.hac_std_error = hac_se
+
+    # T-statistic and p-value
+    if hac_se > 0:
+        t_stat = mean_pnl / hac_se
+        result.t_statistic = t_stat
+
+        # Two-sided p-value using t-distribution
+        from scipy import stats
+        df = n_days - 1
+        result.p_value = float(2 * (1 - stats.t.cdf(abs(t_stat), df)))
+
+        # 95% confidence interval
+        t_crit = stats.t.ppf(0.975, df)
+        result.ci_lower_95 = mean_pnl - t_crit * hac_se
+        result.ci_upper_95 = mean_pnl + t_crit * hac_se
+    else:
+        result.p_value = 1.0
+
+    # Significance flags
+    result.is_significant_5pct = result.p_value < 0.05
+    result.is_significant_1pct = result.p_value < 0.01
+
+    # Interpretation
+    if result.insufficient_sample:
+        result.interpretation = f"Insufficient sample (N={n_days} days). Results are unreliable."
+    elif result.is_significant_1pct:
+        direction = "positive" if mean_pnl > 0 else "negative"
+        result.interpretation = (
+            f"Highly significant (p < 0.01) {direction} edge. "
+            f"Mean daily P&L = ${mean_pnl:.2f} (95% CI: ${result.ci_lower_95:.2f} to ${result.ci_upper_95:.2f}). "
+            f"HAC SE accounts for autocorrelation (bandwidth={bandwidth})."
+        )
+    elif result.is_significant_5pct:
+        direction = "positive" if mean_pnl > 0 else "negative"
+        result.interpretation = (
+            f"Significant (p < 0.05) {direction} edge. "
+            f"Mean daily P&L = ${mean_pnl:.2f} (95% CI: ${result.ci_lower_95:.2f} to ${result.ci_upper_95:.2f})."
+        )
+    else:
+        result.interpretation = (
+            f"No significant edge detected (p = {result.p_value:.4f}). "
+            f"Mean daily P&L = ${mean_pnl:.2f}. "
+            f"95% CI includes zero: [{result.ci_lower_95:.2f}, {result.ci_upper_95:.2f}]."
+        )
+
+    return result

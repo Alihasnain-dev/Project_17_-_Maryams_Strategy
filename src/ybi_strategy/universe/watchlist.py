@@ -25,32 +25,44 @@ from ybi_strategy.polygon.client import PolygonClient
 # - Test/placeholder tickers (ZVZZT, etc.)
 # =============================================================================
 
-# Regex patterns for non-common-stock tickers
-NON_COMMON_PATTERNS = [
-    r"\.WS$",       # Warrants (explicit .WS suffix)
-    r"\.W$",        # Warrants (explicit .W suffix)
-    r"\.U$",        # Units
+# =============================================================================
+# PATTERN CATEGORIES
+# =============================================================================
+# UNAMBIGUOUS patterns: These are safe to apply always (explicit suffixes)
+UNAMBIGUOUS_NON_COMMON_PATTERNS = [
+    r"\.WS$",       # Warrants (explicit .WS suffix, e.g., QBTS.WS)
+    r"\.W$",        # Warrants (explicit .W suffix, e.g., AFRM.W)
+    r"\.U$",        # Units (e.g., SPAC.U)
     r"\.R$",        # Rights
-    r"W$",          # Warrants (W suffix after 4+ chars - has special handling for short tickers)
-    r"P$",          # Preferreds (P suffix after 3+ chars, e.g., CCLDP) - has special handling
-    r"\^",          # Index or special symbols
-    r"\.A$",        # Class A shares (optional - may want to keep these)
-    r"\.B$",        # Class B shares (optional - may want to keep these)
+    r"\^",          # Index or special symbols (e.g., ^SPX)
+]
+
+# AMBIGUOUS patterns: These can cause FALSE POSITIVES on legitimate stocks
+# Examples of legitimate stocks that would be incorrectly filtered:
+#   - SNOW, LKNW, BMW (W suffix) - but these are common stocks
+#   - SHOP, TRIP, COUP (P suffix) - legitimate common stocks
+# These should ONLY be used when reference data is NOT available
+AMBIGUOUS_NON_COMMON_PATTERNS = [
+    r"W$",          # Warrants (W suffix after 4+ chars) - CAN HAVE FALSE POSITIVES
+    r"P$",          # Preferreds (P suffix after 3+ chars) - CAN HAVE FALSE POSITIVES
 ]
 
 # Test/placeholder tickers to exclude
 TEST_TICKERS = {"ZVZZT", "ZVZZC", "ZTEST", "TEST"}
 
 
-def is_common_stock_ticker(ticker: str) -> bool:
+def is_common_stock_ticker(ticker: str, use_ambiguous_patterns: bool = True) -> bool:
     """
     Check if a ticker appears to be a common stock based on pattern rules.
 
-    This is a pattern-based filter as a backstop. For definitive classification,
-    use Polygon reference data when available.
+    IMPORTANT: This is a heuristic filter. For definitive classification,
+    use Polygon reference data (type == "CS", active, not OTC).
 
     Args:
         ticker: The ticker symbol to check.
+        use_ambiguous_patterns: If True (default), apply W$ and P$ patterns which
+            can cause false positives on legitimate stocks like SNOW, SHOP.
+            Set to False when reference data will be used for verification.
 
     Returns:
         True if the ticker appears to be a common stock, False otherwise.
@@ -64,28 +76,34 @@ def is_common_stock_ticker(ticker: str) -> bool:
     if ticker_upper in TEST_TICKERS:
         return False
 
-    # Exclude if matches any non-common pattern
-    for pattern in NON_COMMON_PATTERNS:
+    # Always apply unambiguous patterns (explicit suffixes like .WS, .U, .R)
+    for pattern in UNAMBIGUOUS_NON_COMMON_PATTERNS:
         if re.search(pattern, ticker_upper):
-            # Special case: W suffix only applies to tickers with 4+ chars total
-            if pattern == r"W$":
-                # Allow short tickers ending in W (e.g., "W" itself, "VW", "BMW")
-                if len(ticker_upper) <= 3:
-                    continue
-                # Check if the base (without W) is at least 3 chars
-                base = ticker_upper[:-1]
-                if len(base) < 3:
-                    continue
-            # Special case: P suffix (preferreds) only applies to tickers with 4+ chars total
-            if pattern == r"P$":
-                # Allow short tickers ending in P (e.g., "P", "UP", "APP")
-                if len(ticker_upper) <= 3:
-                    continue
-                # Check if the base (without P) is at least 3 chars
-                base = ticker_upper[:-1]
-                if len(base) < 3:
-                    continue
             return False
+
+    # Only apply ambiguous patterns if explicitly requested
+    # These patterns (W$, P$) can cause FALSE POSITIVES on legitimate stocks
+    if use_ambiguous_patterns:
+        for pattern in AMBIGUOUS_NON_COMMON_PATTERNS:
+            if re.search(pattern, ticker_upper):
+                # Special case: W suffix only applies to tickers with 4+ chars total
+                if pattern == r"W$":
+                    # Allow short tickers ending in W (e.g., "W" itself, "VW", "BMW")
+                    if len(ticker_upper) <= 3:
+                        continue
+                    # Check if the base (without W) is at least 3 chars
+                    base = ticker_upper[:-1]
+                    if len(base) < 3:
+                        continue
+                # Special case: P suffix only applies to tickers with 4+ chars total
+                if pattern == r"P$":
+                    # Allow short tickers ending in P (e.g., "P", "UP", "APP")
+                    if len(ticker_upper) <= 3:
+                        continue
+                    base = ticker_upper[:-1]
+                    if len(base) < 3:
+                        continue
+                return False
 
     # Basic format check: only alphanumeric and dots, 1-10 chars
     if not re.match(r"^[A-Z0-9\.]{1,10}$", ticker_upper):
@@ -102,32 +120,40 @@ def filter_common_stocks(
     """
     Filter a list of tickers to only include common stocks.
 
+    IMPORTANT: When use_reference_data=True, this function does NOT apply
+    ambiguous pattern rules (W$, P$) because they cause false positives.
+    Instead, it relies on Polygon reference data for definitive classification.
+
     Args:
         tickers: List of ticker symbols to filter.
         polygon: Optional PolygonClient for reference data lookup.
-        use_reference_data: Whether to use Polygon reference data (slower but more accurate).
+        use_reference_data: Whether to use Polygon reference data (recommended).
 
     Returns:
         List of tickers that are classified as common stocks.
     """
     common_stocks = []
 
+    # When reference data is available, don't use ambiguous patterns (W$, P$)
+    # to avoid false positives on legitimate stocks like SNOW, SHOP
+    use_ambiguous = not (use_reference_data and polygon is not None)
+
     for ticker in tickers:
-        # First apply pattern-based filter (fast)
-        if not is_common_stock_ticker(ticker):
+        # Apply pattern-based filter
+        # CRITICAL: Skip ambiguous patterns when reference data will verify
+        if not is_common_stock_ticker(ticker, use_ambiguous_patterns=use_ambiguous):
             continue
 
-        # Optionally verify with Polygon reference data
+        # When reference data is enabled, use Polygon for definitive classification
         if use_reference_data and polygon is not None:
             details = polygon.ticker_details(ticker)
             if details:
-                # Check asset type
+                # Check asset type - ONLY allow common stocks (CS)
                 ticker_type = details.get("type", "")
                 market = details.get("market", "")
 
-                # Only allow common stocks (CS) on major exchanges
-                # Exclude: WARRANT, ETF, ETN, FUND, UNIT, RIGHT, ADR, etc.
-                if ticker_type not in ("CS",):
+                # Exclude: WARRANT, ETF, ETN, FUND, UNIT, RIGHT, ADR, PFD, etc.
+                if ticker_type != "CS":
                     continue
 
                 # Exclude OTC markets
@@ -137,6 +163,10 @@ def filter_common_stocks(
                 # Exclude inactive tickers
                 if not details.get("active", True):
                     continue
+            else:
+                # No reference data available - skip this ticker to be safe
+                # (could also use ambiguous patterns here as fallback)
+                continue
 
         common_stocks.append(ticker)
 
@@ -209,20 +239,17 @@ def build_watchlist_open_gap(
     merged["gap_pct"] = (merged["open_price"] / merged["prev_close"]) - 1.0
     merged = merged[merged["gap_pct"] >= min_gap_pct]
 
-    # CRITICAL FIX: Filter to common stocks only (exclude warrants, units, OTC)
+    # CRITICAL: Filter to common stocks only (exclude warrants, units, OTC, preferreds)
     if filter_common_stocks_only:
-        # First pass: fast pattern-based filter
-        valid_tickers = [t for t in merged["ticker"].tolist() if is_common_stock_ticker(str(t))]
-        merged = merged[merged["ticker"].isin(valid_tickers)]
-
-        # Optional: stricter filtering using Polygon reference data
-        if use_reference_data:
-            verified_tickers = filter_common_stocks(
-                merged["ticker"].tolist(),
-                polygon=polygon,
-                use_reference_data=True,
-            )
-            merged = merged[merged["ticker"].isin(verified_tickers)]
+        # Use filter_common_stocks which handles reference data properly
+        # When use_reference_data=True, it skips ambiguous patterns (W$, P$)
+        # to avoid false positives on legitimate stocks
+        verified_tickers = filter_common_stocks(
+            merged["ticker"].tolist(),
+            polygon=polygon,
+            use_reference_data=use_reference_data,
+        )
+        merged = merged[merged["ticker"].isin(verified_tickers)]
 
     merged = merged.sort_values("gap_pct", ascending=False).head(int(top_n))
     items: list[WatchlistItem] = []

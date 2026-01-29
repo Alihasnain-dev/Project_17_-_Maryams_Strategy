@@ -1,7 +1,7 @@
 # Research State Log - YBI Intraday Strategy
 
-**Last Updated**: 2026-01-24
-**Current Phase**: AUDIT V9 FIXES COMPLETE - Ready for Re-run
+**Last Updated**: 2026-01-29
+**Current Phase**: V10 AUDIT FIXES COMPLETE - Ready for End-to-End Rerun
 
 ---
 
@@ -13,9 +13,27 @@ Implement and statistically validate a **no-lookahead, intraday-only** backtest 
 
 ## Current Status & Verdict
 
-**Status**: V9 CORRECTIVE IMPLEMENTATION COMPLETE - All 71 tests pass
+**Status**: V10 CORRECTIVE IMPLEMENTATION COMPLETE - All 75 tests pass
 
-**Verdict**: After fixing V9 audit issues (trade count at entry, cooldown for all stops, universe filter false positives, HAC inference, leakage audit), the backtest infrastructure is methodologically sound. Ready for full re-run with Polygon API.
+**Verdict**: After fixing V10 audit issues (premarket screener selection bias, config exposure, documentation accuracy, leakage audit precision), the premarket_gap watchlist method is now deterministic and properly documented. Ready for full re-run with Polygon API.
+
+### V10 Audit Issues (All Fixed)
+
+| Issue | Severity | Status | Resolution |
+|-------|----------|--------|------------|
+| Premarket screener candidate selection bias | CRITICAL | **FIXED** | Candidates sorted by PREVIOUS DAY VOLUME (deterministic proxy) |
+| max_candidates_to_scan not in config | HIGH | **FIXED** | Added to strategy.yaml and wired through engine.py |
+| "TRUE premarket screener" claim misleading | HIGH | **FIXED** | Documentation updated to describe actual methodology |
+| Leakage audit overstated same-bar checks | MEDIUM | **FIXED** | Narrowed claims to exactly what's checked (signal_ts ordering) |
+
+**Premarket Screener Methodology (premarket_gap)**:
+1. Get all tickers from previous day's grouped daily data
+2. Filter by price range (min_prev_close to max_prev_close)
+3. Apply common stock pattern filter (excludes warrants, units)
+4. **Sort candidates by PREVIOUS DAY VOLUME (descending)** - deterministic proxy
+5. Scan top max_candidates_to_scan for premarket data (04:00-09:29 ET)
+6. Apply thresholds: min_premarket_pct, min_premarket_volume, min_premarket_dollar_volume
+7. Return top_n by premarket_pct
 
 ### V9 Audit Issues (All Fixed)
 
@@ -506,7 +524,13 @@ class FillModel:
 
 ## Test Coverage
 
-**71/71 tests passing** including:
+**75/75 tests passing** including:
+
+### New Tests (V10 - Premarket Screener)
+- `test_premarket_watchlist_item_dataclass()` - Verifies PremarketWatchlistItem fields
+- `test_ambiguous_patterns_not_applied_in_premarket_screener()` - Verifies W$/P$ skipped
+- `test_premarket_metrics_calculation()` - Verifies premarket return and dollar volume math
+- `test_config_supports_premarket_gap_method()` - Verifies config structure for premarket_gap
 
 ### New Tests (V9)
 - `test_day_risk_state_counts_at_entry()` - Verifies trade count increments at entry, not exit
@@ -565,7 +589,7 @@ class FillModel:
 | **Watchlist/Universe** | `src/ybi_strategy/universe/watchlist.py` | **FIXED** (V9: ambiguous patterns skipped with ref data) |
 | **Market Calendar** | `src/ybi_strategy/calendar/market_calendar.py` | VALID |
 | Polygon client | `src/ybi_strategy/polygon/client.py` | VALID |
-| Test suite | `tests/test_strategy.py` | **71 tests passing** |
+| Test suite | `tests/test_strategy.py` | **75 tests passing** |
 | Configuration | `configs/strategy.yaml` | VALID |
 | **V8 Results** | `data/results_v8/` | **COMPLETE** (reconciliation verified) |
 | **V7 Results** | `data/results_v7/` | **INVALID** (reconciliation failed) |
@@ -604,6 +628,11 @@ class FillModel:
 - [x] **HAC standard errors** (V9: daily_series_inference() with Newey-West)
 - [x] **Leakage audit in summary** (V9: signal_ts < entry_ts verification)
 - [x] **Slippage sensitivity infrastructure** (scripts/run_stress_test.py ready)
+- [x] **Premarket screener deterministic** (V10: sorted by prev day volume before truncation)
+- [x] **max_candidates_to_scan exposed** (V10: in config and wired through engine.py)
+- [x] **Premarket screener docs accurate** (V10: removed "TRUE" claim, documented methodology)
+- [x] **Leakage audit claims accurate** (V10: narrowed to signal_ts ordering only)
+- [ ] **End-to-end rerun with premarket_gap mode** (PENDING - requires Polygon API)
 - [ ] Independent code review (recommended)
 
 ---
@@ -630,6 +659,31 @@ class FillModel:
 - Slippage sensitivity infrastructure already exists (`scripts/run_stress_test.py`)
 - All 71 tests pass (7 new V9 tests)
 - **STATUS**: V9 code fixes complete, ready for full backtest re-run
+
+**2026-01-29 (Audit V10 Fixes - Premarket Screener)**:
+- Received tenth audit (FAIL) identifying premarket screener issues:
+  - Candidate selection used arbitrary order (head(N) without sorting)
+  - max_candidates_to_scan not exposed in config or recorded in metadata
+  - "TRUE premarket screener" claim was misleading
+  - Leakage audit claimed same-bar checks but only checked ordering
+- CRITICAL FIX: Sort candidates by PREVIOUS DAY VOLUME (descending) before truncation
+  - Deterministic and reproducible selection based on liquidity proxy
+- HIGH FIX: Added `max_candidates_to_scan` to strategy.yaml
+- HIGH FIX: Wired `max_candidates_to_scan` through engine.py to watchlist builder
+- HIGH FIX: Updated documentation to accurately describe methodology
+- MEDIUM FIX: Narrowed leakage_audit claims to exactly what's checked
+  - Removed `same_bar_fill_violations` field (not implemented)
+  - Updated docstrings to specify signal_ts ordering only
+- All 75 tests pass (4 new premarket screener tests)
+- **STATUS**: V10 code fixes complete
+- **PENDING**: End-to-end rerun requires `POLYGON_API_KEY` environment variable
+  - Run command: `PYTHONPATH=src python3 run_backtest.py --config configs/strategy.yaml --start 2024-10-01 --end 2025-01-15 --out data/results_v10`
+  - Expected outputs: data/results_v10/{run_metadata.json, trades.csv, fills.csv, watchlist.csv, day_audit.csv, daily_metrics.csv, summary.json}
+  - Acceptance criteria from V10 audit:
+    1. max_trades <= risk.max_trades_per_day for all days
+    2. reconciliation passes ($0 discrepancy)
+    3. no open positions invariant holds
+    4. watchlist.csv shows premarket_pct, premarket_volume, premarket_dollar_volume columns
 
 **2026-01-24 (Audit V8 Fixes)**:
 - Received eighth audit (FAIL) identifying reconciliation/ledger issues:

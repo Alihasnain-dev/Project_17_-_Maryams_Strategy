@@ -8,11 +8,28 @@
 timezone: America/New_York
 
 watchlist:
-  method: open_gap   # open_gap | premarket_gap (future)
+  # method: open_gap | premarket_gap
+  # - open_gap: Screens by (today's open / prev close) - gap at market open
+  # - premarket_gap: Premarket screener using 04:00-09:29 ET minute data
+  #   METHODOLOGY: Candidates prioritized by PREVIOUS DAY VOLUME (descending),
+  #   then scanned for premarket return/volume/dollar_volume thresholds.
+  #   This is NOT a full universe scan - it samples top N by prev volume.
+  method: premarket_gap
+
+  # Common parameters (both methods)
   top_n: 20
-  min_gap_pct: 0.05
   min_prev_close: 0.50
   max_prev_close: 20.0
+
+  # open_gap method parameters
+  min_gap_pct: 0.05              # Minimum open-gap % (for open_gap method)
+
+  # premarket_gap method parameters
+  min_premarket_pct: 0.05        # Minimum premarket return (5%)
+  min_premarket_volume: 50000    # Minimum shares traded in premarket
+  min_premarket_dollar_volume: 100000  # Minimum $ volume in premarket (liquidity)
+  max_candidates_to_scan: 200    # Max tickers to fetch premarket data for (API budget)
+                                 # Candidates sorted by prev day volume (deterministic)
 
 session:
   premarket_start: "04:00"

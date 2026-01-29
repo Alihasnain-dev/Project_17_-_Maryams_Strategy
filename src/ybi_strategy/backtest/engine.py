@@ -22,7 +22,12 @@ from ybi_strategy.backtest.fills import FillModel
 from ybi_strategy.backtest.portfolio import simulate_portfolio_day
 from ybi_strategy.strategy.ybi_small_caps import simulate_ybi_small_caps, DayRiskState
 from ybi_strategy.timeutils import SessionTimes, parse_hhmm
-from ybi_strategy.universe.watchlist import build_watchlist_open_gap
+from ybi_strategy.universe.watchlist import (
+    build_watchlist_open_gap,
+    build_watchlist_premarket_gappers,
+    WatchlistItem,
+    PremarketWatchlistItem,
+)
 from ybi_strategy.calendar import is_market_holiday, is_weekend
 from ybi_strategy.reporting.metrics import compute_metrics, compute_daily_metrics
 from ybi_strategy.reporting.analysis import (
@@ -388,19 +393,56 @@ class BacktestEngine:
         }
 
     def _run_day(self, d: date) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        wl = build_watchlist_open_gap(
-            polygon=self.polygon,
-            day=d,
-            top_n=int(self.config.get("watchlist", "top_n", default=20)),
-            min_gap_pct=float(self.config.get("watchlist", "min_gap_pct", default=0.05)),
-            min_prev_close=float(self.config.get("watchlist", "min_prev_close", default=0.5)),
-            max_prev_close=float(self.config.get("watchlist", "max_prev_close", default=20.0)),
-        )
+        # Get watchlist method from config (default: open_gap for backwards compatibility)
+        wl_method = str(self.config.get("watchlist", "method", default="open_gap"))
 
-        watchlist_rows: list[dict[str, Any]] = [
-            {"date": d.isoformat(), "ticker": i.ticker, "gap_pct": i.gap_pct, "prev_close": i.prev_close, "open_price": i.open_price}
-            for i in wl
-        ]
+        wl: list[WatchlistItem] | list[PremarketWatchlistItem]
+        watchlist_rows: list[dict[str, Any]] = []
+
+        if wl_method == "premarket_gap":
+            # Premarket gappers screener (04:00-09:29 behavior)
+            # Candidates prioritized by prev day volume, then filtered by premarket metrics
+            wl = build_watchlist_premarket_gappers(
+                polygon=self.polygon,
+                day=d,
+                top_n=int(self.config.get("watchlist", "top_n", default=20)),
+                min_premarket_pct=float(self.config.get("watchlist", "min_premarket_pct", default=0.05)),
+                min_prev_close=float(self.config.get("watchlist", "min_prev_close", default=0.5)),
+                max_prev_close=float(self.config.get("watchlist", "max_prev_close", default=20.0)),
+                min_premarket_volume=int(self.config.get("watchlist", "min_premarket_volume", default=50000)),
+                min_premarket_dollar_volume=float(self.config.get("watchlist", "min_premarket_dollar_volume", default=100000.0)),
+                premarket_start=str(self.config.get("session", "premarket_start", default="04:00")),
+                premarket_end=str(self.config.get("session", "premarket_end", default="09:29")),
+                max_candidates_to_scan=int(self.config.get("watchlist", "max_candidates_to_scan", default=200)),
+            )
+            watchlist_rows = [
+                {
+                    "date": d.isoformat(),
+                    "ticker": i.ticker,
+                    "prev_close": i.prev_close,
+                    "premarket_pct": i.premarket_pct,
+                    "premarket_last": i.premarket_last,
+                    "premarket_high": i.premarket_high,
+                    "premarket_volume": i.premarket_volume,
+                    "premarket_dollar_volume": i.premarket_dollar_volume,
+                    "premarket_vwap": i.premarket_vwap,
+                }
+                for i in wl
+            ]
+        else:
+            # Legacy open-gap screener (default)
+            wl = build_watchlist_open_gap(
+                polygon=self.polygon,
+                day=d,
+                top_n=int(self.config.get("watchlist", "top_n", default=20)),
+                min_gap_pct=float(self.config.get("watchlist", "min_gap_pct", default=0.05)),
+                min_prev_close=float(self.config.get("watchlist", "min_prev_close", default=0.5)),
+                max_prev_close=float(self.config.get("watchlist", "max_prev_close", default=20.0)),
+            )
+            watchlist_rows = [
+                {"date": d.isoformat(), "ticker": i.ticker, "gap_pct": i.gap_pct, "prev_close": i.prev_close, "open_price": i.open_price}
+                for i in wl
+            ]
 
         # Compute previous trading day for PDH/PDL
         prev_day = self._prev_trading_day(d)

@@ -1303,20 +1303,27 @@ def reconcile_trades_and_fills(
 @dataclass
 class LeakageAuditResult:
     """
-    Results from leakage audit verifying no lookahead bias.
+    Results from leakage audit verifying signal->entry causality.
 
-    For a valid backtest, ALL trades must satisfy:
-    - signal_ts < entry_ts (signal must precede entry)
-    - entry occurs at next bar open (not same bar as signal)
+    WHAT THIS CHECKS:
+    - signal_ts < entry_ts: Signal timestamp strictly precedes entry timestamp
+    - signal_ts != entry_ts: Signal and entry are not at the same timestamp
+
+    WHAT THIS DOES NOT CHECK:
+    - Bar-level causality (requires knowing bar frequency)
+    - Feature computation lookahead (requires code review)
+    - Watchlist selection lookahead (requires code review)
+
+    NOTE: For minute-bar backtests, signal_equals_entry effectively catches
+    same-bar fills since both would round to the same minute.
     """
     total_trades: int = 0
     trades_with_signal_ts: int = 0
     trades_with_entry_ts: int = 0
 
     # Violation counts (must be zero for valid backtest)
-    signal_after_entry_violations: int = 0
-    signal_equals_entry_violations: int = 0
-    same_bar_fill_violations: int = 0
+    signal_after_entry_violations: int = 0      # signal_ts > entry_ts
+    signal_equals_entry_violations: int = 0     # signal_ts == entry_ts
 
     # Details of violations (if any)
     violation_details: list[dict[str, Any]] = field(default_factory=list)
@@ -1333,11 +1340,9 @@ class LeakageAuditResult:
             "trades_with_entry_ts": self.trades_with_entry_ts,
             "signal_after_entry_violations": self.signal_after_entry_violations,
             "signal_equals_entry_violations": self.signal_equals_entry_violations,
-            "same_bar_fill_violations": self.same_bar_fill_violations,
             "total_violations": (
                 self.signal_after_entry_violations +
-                self.signal_equals_entry_violations +
-                self.same_bar_fill_violations
+                self.signal_equals_entry_violations
             ),
             "is_valid": self.is_valid,
             "audit_message": self.audit_message,
@@ -1347,11 +1352,19 @@ class LeakageAuditResult:
 
 def leakage_audit(trades_df: pd.DataFrame) -> LeakageAuditResult:
     """
-    Audit trades for lookahead bias (leakage).
+    Audit trades for signal->entry causality violations.
 
-    Verifies that for ALL trades:
+    Checks that for ALL trades with both signal_ts and entry_ts:
     1. signal_ts < entry_ts (signal must strictly precede entry)
-    2. Entries occur at the next bar open, not on the signal bar
+    2. signal_ts != entry_ts (no same-timestamp signals and entries)
+
+    NOTE: This checks timestamp ordering only. It does NOT verify:
+    - Bar-level causality (requires knowing bar frequency)
+    - Feature computation lookahead (requires code review)
+    - Watchlist selection lookahead (requires code review)
+
+    For minute-bar backtests, signal_equals_entry effectively catches
+    same-bar fills since both timestamps round to the same minute.
 
     Args:
         trades_df: DataFrame with 'signal_ts' and 'entry_ts' columns.
@@ -1426,8 +1439,7 @@ def leakage_audit(trades_df: pd.DataFrame) -> LeakageAuditResult:
     # Determine overall validity
     total_violations = (
         result.signal_after_entry_violations +
-        result.signal_equals_entry_violations +
-        result.same_bar_fill_violations
+        result.signal_equals_entry_violations
     )
 
     result.is_valid = total_violations == 0
@@ -1435,14 +1447,14 @@ def leakage_audit(trades_df: pd.DataFrame) -> LeakageAuditResult:
     if result.is_valid:
         result.audit_message = (
             f"PASS: All {result.trades_with_signal_ts} trades have signal_ts < entry_ts. "
-            "No lookahead bias detected."
+            "Signal->entry causality verified."
         )
     else:
         result.audit_message = (
-            f"FAIL: {total_violations} violations detected. "
+            f"FAIL: {total_violations} causality violations detected. "
             f"signal_after_entry={result.signal_after_entry_violations}, "
             f"signal_equals_entry={result.signal_equals_entry_violations}. "
-            "This indicates potential lookahead bias."
+            "This indicates potential lookahead bias in signal generation."
         )
 
     return result

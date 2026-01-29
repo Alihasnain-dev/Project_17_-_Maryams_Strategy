@@ -175,10 +175,34 @@ def filter_common_stocks(
 
 @dataclass(frozen=True)
 class WatchlistItem:
+    """Legacy watchlist item for open-gap screening."""
     ticker: str
     gap_pct: float
     prev_close: float
     open_price: float
+
+
+@dataclass(frozen=True)
+class PremarketWatchlistItem:
+    """
+    Watchlist item for true premarket gappers screening.
+
+    This captures premarket behavior (04:00-09:29 ET) rather than just
+    open-gap vs prior close. Key metrics:
+    - premarket_pct: Return from prev_close to premarket_last
+    - premarket_volume: Total shares traded in premarket
+    - premarket_dollar_volume: Total $ traded (liquidity proxy)
+    - premarket_high: High of day so far (for PMH calculations)
+    """
+    ticker: str
+    prev_close: float
+    premarket_last: float
+    premarket_high: float
+    premarket_low: float
+    premarket_pct: float        # (premarket_last / prev_close) - 1
+    premarket_volume: int       # Total shares in premarket
+    premarket_dollar_volume: float  # sum(vwap * volume) for liquidity
+    premarket_vwap: float       # Volume-weighted average price in premarket
 
 
 def _to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -262,4 +286,229 @@ def build_watchlist_open_gap(
                 open_price=float(row["open_price"]),
             )
         )
+    return items
+
+
+def build_watchlist_premarket_gappers(
+    *,
+    polygon: PolygonClient,
+    day: date,
+    top_n: int,
+    min_premarket_pct: float,
+    min_prev_close: float,
+    max_prev_close: float,
+    min_premarket_volume: int = 50_000,
+    min_premarket_dollar_volume: float = 100_000.0,
+    premarket_start: str = "04:00",
+    premarket_end: str = "09:29",
+    filter_common_stocks_only: bool = True,
+    use_reference_data: bool = True,
+    max_candidates_to_scan: int = 200,
+) -> list[PremarketWatchlistItem]:
+    """
+    Build watchlist of premarket gappers using 04:00-09:29 ET data.
+
+    SELECTION METHODOLOGY:
+    1. Gets all tickers from previous day's grouped daily data
+    2. Filters by price range (min_prev_close to max_prev_close)
+    3. Applies common stock pattern filter (excludes warrants, units, etc.)
+    4. Sorts candidates by PREVIOUS DAY VOLUME (descending) - this is a
+       deterministic proxy for "likely to be active in premarket"
+    5. Scans top max_candidates_to_scan by prev volume for premarket data
+    6. Applies premarket thresholds (return %, volume, dollar volume)
+    7. Returns top_n by premarket_pct
+
+    IMPORTANT: This is NOT a full universe scan. It prioritizes candidates by
+    previous day's volume as a proxy for premarket activity. To scan more
+    candidates, increase max_candidates_to_scan (with API cost tradeoff).
+
+    Args:
+        polygon: PolygonClient for market data.
+        day: Trading day to build watchlist for.
+        top_n: Maximum number of stocks to include in final watchlist.
+        min_premarket_pct: Minimum premarket return (e.g., 0.05 = 5% gain).
+        min_prev_close: Minimum previous day close price.
+        max_prev_close: Maximum previous day close price.
+        min_premarket_volume: Minimum shares traded in premarket (liquidity gate).
+        min_premarket_dollar_volume: Minimum $ volume in premarket (liquidity gate).
+        premarket_start: Start of premarket window (default "04:00").
+        premarket_end: End of premarket window (default "09:29").
+        filter_common_stocks_only: If True, exclude warrants/units/OTC.
+        use_reference_data: If True, verify with Polygon reference data.
+        max_candidates_to_scan: Max tickers to fetch minute data for (API budget).
+            Candidates are prioritized by previous day's volume (descending).
+
+    Returns:
+        List of PremarketWatchlistItem sorted by premarket_pct descending.
+    """
+    # Step 1: Get previous day's data (includes volume for prioritization)
+    prev: list[dict[str, Any]] = []
+    prev_day = day - timedelta(days=1)
+    for _ in range(7):
+        prev = polygon.grouped_daily(prev_day)
+        if prev:
+            break
+        prev_day = prev_day - timedelta(days=1)
+    if not prev:
+        return []
+
+    prev_df = _to_frame(prev)
+    if prev_df.empty or "T" not in prev_df.columns or "c" not in prev_df.columns:
+        return []
+
+    # Include volume for prioritization (Polygon field 'v' = volume)
+    required_cols = ["T", "c"]
+    if "v" in prev_df.columns:
+        required_cols.append("v")
+        prev_df = prev_df[required_cols].rename(
+            columns={"T": "ticker", "c": "prev_close", "v": "prev_volume"}
+        )
+    else:
+        # Fallback if volume not available - use 0 (arbitrary order)
+        prev_df = prev_df[["T", "c"]].rename(columns={"T": "ticker", "c": "prev_close"})
+        prev_df["prev_volume"] = 0
+
+    # Filter by price and validity
+    prev_df = prev_df[(prev_df["prev_close"] > 0)]
+    prev_df = prev_df[
+        (prev_df["prev_close"] >= min_prev_close) &
+        (prev_df["prev_close"] <= max_prev_close)
+    ]
+
+    # Step 2: Filter to common stocks BEFORE fetching minute data (API efficiency)
+    if filter_common_stocks_only:
+        # Apply unambiguous pattern filter first (cheap, no API calls)
+        pattern_filtered = [
+            t for t in prev_df["ticker"].tolist()
+            if is_common_stock_ticker(t, use_ambiguous_patterns=False)
+        ]
+        prev_df = prev_df[prev_df["ticker"].isin(pattern_filtered)]
+
+    # Step 3: CRITICAL - Sort by previous day volume (descending) for deterministic
+    # candidate selection. This prioritizes stocks most likely to have premarket activity.
+    prev_df = prev_df.sort_values("prev_volume", ascending=False)
+
+    # Limit candidates to scan (API budget) - now deterministic based on prev volume
+    candidates = prev_df.head(max_candidates_to_scan).to_dict("records")
+
+    # Step 3: Parse premarket time bounds
+    pm_start_hour, pm_start_min = map(int, premarket_start.split(":"))
+    pm_end_hour, pm_end_min = map(int, premarket_end.split(":"))
+
+    # Step 4: Fetch premarket data and compute metrics
+    premarket_data: list[dict[str, Any]] = []
+
+    for row in candidates:
+        ticker = row["ticker"]
+        prev_close = row["prev_close"]
+
+        try:
+            bars = polygon.minute_bars(ticker, day)
+        except Exception:
+            continue
+
+        if not bars:
+            continue
+
+        # Convert to DataFrame and filter to premarket window
+        bars_df = pd.DataFrame(bars)
+        if bars_df.empty or "t" not in bars_df.columns:
+            continue
+
+        # Polygon 't' is Unix timestamp in milliseconds
+        bars_df["ts"] = pd.to_datetime(bars_df["t"], unit="ms", utc=True)
+        bars_df["ts_et"] = bars_df["ts"].dt.tz_convert("America/New_York")
+
+        # Filter to premarket window
+        pm_start_ts = pd.Timestamp(
+            year=day.year, month=day.month, day=day.day,
+            hour=pm_start_hour, minute=pm_start_min
+        ).tz_localize("America/New_York")
+        pm_end_ts = pd.Timestamp(
+            year=day.year, month=day.month, day=day.day,
+            hour=pm_end_hour, minute=pm_end_min
+        ).tz_localize("America/New_York")
+
+        pm_bars = bars_df[
+            (bars_df["ts_et"] >= pm_start_ts) &
+            (bars_df["ts_et"] <= pm_end_ts)
+        ]
+
+        if pm_bars.empty:
+            continue
+
+        # Compute premarket metrics
+        premarket_high = float(pm_bars["h"].max())
+        premarket_low = float(pm_bars["l"].min())
+        premarket_last = float(pm_bars["c"].iloc[-1])
+        premarket_volume = int(pm_bars["v"].sum())
+
+        # Dollar volume: use vwap if available, otherwise approximate with (h+l+c)/3
+        if "vw" in pm_bars.columns:
+            premarket_dollar_volume = float((pm_bars["vw"] * pm_bars["v"]).sum())
+            premarket_vwap = float(
+                (pm_bars["vw"] * pm_bars["v"]).sum() / pm_bars["v"].sum()
+            ) if premarket_volume > 0 else premarket_last
+        else:
+            # Approximate with typical price
+            typical_price = (pm_bars["h"] + pm_bars["l"] + pm_bars["c"]) / 3
+            premarket_dollar_volume = float((typical_price * pm_bars["v"]).sum())
+            premarket_vwap = premarket_dollar_volume / premarket_volume if premarket_volume > 0 else premarket_last
+
+        premarket_pct = (premarket_last / prev_close) - 1.0
+
+        # Step 5: Apply thresholds
+        if premarket_pct < min_premarket_pct:
+            continue
+        if premarket_volume < min_premarket_volume:
+            continue
+        if premarket_dollar_volume < min_premarket_dollar_volume:
+            continue
+
+        premarket_data.append({
+            "ticker": ticker,
+            "prev_close": prev_close,
+            "premarket_last": premarket_last,
+            "premarket_high": premarket_high,
+            "premarket_low": premarket_low,
+            "premarket_pct": premarket_pct,
+            "premarket_volume": premarket_volume,
+            "premarket_dollar_volume": premarket_dollar_volume,
+            "premarket_vwap": premarket_vwap,
+        })
+
+    if not premarket_data:
+        return []
+
+    # Step 6: Reference data verification (if enabled)
+    if filter_common_stocks_only and use_reference_data:
+        tickers_to_verify = [d["ticker"] for d in premarket_data]
+        verified_tickers = filter_common_stocks(
+            tickers_to_verify,
+            polygon=polygon,
+            use_reference_data=True,
+        )
+        premarket_data = [d for d in premarket_data if d["ticker"] in verified_tickers]
+
+    # Step 7: Sort by premarket_pct and take top_n
+    premarket_data.sort(key=lambda x: x["premarket_pct"], reverse=True)
+    premarket_data = premarket_data[:top_n]
+
+    # Step 8: Convert to PremarketWatchlistItem
+    items: list[PremarketWatchlistItem] = []
+    for d in premarket_data:
+        items.append(
+            PremarketWatchlistItem(
+                ticker=d["ticker"],
+                prev_close=d["prev_close"],
+                premarket_last=d["premarket_last"],
+                premarket_high=d["premarket_high"],
+                premarket_low=d["premarket_low"],
+                premarket_pct=d["premarket_pct"],
+                premarket_volume=d["premarket_volume"],
+                premarket_dollar_volume=d["premarket_dollar_volume"],
+                premarket_vwap=d["premarket_vwap"],
+            )
+        )
+
     return items

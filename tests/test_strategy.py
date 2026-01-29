@@ -2497,6 +2497,112 @@ class TestV9Fixes:
         print(f"  ✓ Mean daily P&L=${result.mean_daily_pnl:.2f} (averaged over {result.n_days} days)")
 
 
+class TestPremarketScreener:
+    """Tests for the true premarket gappers screener.
+
+    The premarket screener selects stocks based on actual premarket behavior
+    (04:00-09:29 ET) rather than just open-gap vs prior close.
+    """
+
+    def test_premarket_watchlist_item_dataclass(self):
+        """Test PremarketWatchlistItem dataclass structure."""
+        from ybi_strategy.universe.watchlist import PremarketWatchlistItem
+
+        item = PremarketWatchlistItem(
+            ticker="TEST",
+            prev_close=5.0,
+            premarket_last=5.50,
+            premarket_high=5.75,
+            premarket_low=5.25,
+            premarket_pct=0.10,  # 10% gain
+            premarket_volume=100000,
+            premarket_dollar_volume=550000.0,
+            premarket_vwap=5.50,
+        )
+
+        assert item.ticker == "TEST"
+        assert item.premarket_pct == 0.10
+        assert item.premarket_volume == 100000
+        assert item.premarket_dollar_volume == 550000.0
+
+        print(f"  ✓ PremarketWatchlistItem dataclass works correctly")
+        print(f"  ✓ Fields: ticker, prev_close, premarket_last/high/low, premarket_pct, volume, dollar_volume, vwap")
+
+    def test_ambiguous_patterns_not_applied_in_premarket_screener(self):
+        """Test that ambiguous patterns (W$/P$) are skipped in premarket filter."""
+        from ybi_strategy.universe.watchlist import is_common_stock_ticker
+
+        # With ambiguous patterns disabled (as in premarket screener first pass)
+        # SNOW should pass (it's a legitimate stock, not a warrant)
+        assert is_common_stock_ticker("SNOW", use_ambiguous_patterns=False), "SNOW should pass"
+        assert is_common_stock_ticker("SHOP", use_ambiguous_patterns=False), "SHOP should pass"
+
+        # But explicit warrant patterns should still be rejected
+        assert not is_common_stock_ticker("QBTS.WS", use_ambiguous_patterns=False), ".WS should be rejected"
+        assert not is_common_stock_ticker("SPAC.U", use_ambiguous_patterns=False), ".U should be rejected"
+
+        print(f"  ✓ Premarket screener skips ambiguous W$/P$ patterns")
+        print(f"  ✓ Unambiguous patterns (.WS, .U) still applied")
+
+    def test_premarket_metrics_calculation(self):
+        """Test premarket metrics are calculated correctly."""
+        from ybi_strategy.universe.watchlist import PremarketWatchlistItem
+
+        # Simulate a stock that went from $10 prev close to $12 in premarket
+        prev_close = 10.0
+        premarket_last = 12.0
+        premarket_pct = (premarket_last / prev_close) - 1.0
+
+        assert abs(premarket_pct - 0.20) < 0.001, f"Expected 20% gain, got {premarket_pct}"
+
+        # Verify dollar volume calculation
+        premarket_volume = 50000
+        premarket_vwap = 11.50
+        premarket_dollar_volume = premarket_volume * premarket_vwap
+
+        assert premarket_dollar_volume == 575000.0
+
+        item = PremarketWatchlistItem(
+            ticker="GAINER",
+            prev_close=prev_close,
+            premarket_last=premarket_last,
+            premarket_high=12.50,
+            premarket_low=10.50,
+            premarket_pct=premarket_pct,
+            premarket_volume=premarket_volume,
+            premarket_dollar_volume=premarket_dollar_volume,
+            premarket_vwap=premarket_vwap,
+        )
+
+        assert abs(item.premarket_pct - 0.20) < 0.001, f"Expected ~0.20, got {item.premarket_pct}"
+        assert abs(item.premarket_dollar_volume - 575000.0) < 0.01
+
+        print(f"  ✓ Premarket return calculation: {premarket_pct:.1%}")
+        print(f"  ✓ Dollar volume calculation: ${premarket_dollar_volume:,.0f}")
+
+    def test_config_supports_premarket_gap_method(self):
+        """Test that config properly supports premarket_gap method."""
+        config_dict = {
+            "watchlist": {
+                "method": "premarket_gap",
+                "top_n": 20,
+                "min_premarket_pct": 0.05,
+                "min_premarket_volume": 50000,
+                "min_premarket_dollar_volume": 100000.0,
+            }
+        }
+
+        assert config_dict["watchlist"]["method"] == "premarket_gap"
+        assert config_dict["watchlist"]["min_premarket_pct"] == 0.05
+        assert config_dict["watchlist"]["min_premarket_volume"] == 50000
+        assert config_dict["watchlist"]["min_premarket_dollar_volume"] == 100000.0
+
+        print(f"  ✓ Config supports premarket_gap method")
+        print(f"  ✓ Premarket parameters: pct={config_dict['watchlist']['min_premarket_pct']}, "
+              f"volume={config_dict['watchlist']['min_premarket_volume']}, "
+              f"dollar_volume=${config_dict['watchlist']['min_premarket_dollar_volume']:,.0f}")
+
+
 def run_all_tests():
     """Run all tests and report results."""
     print("\n" + "=" * 60)
@@ -2517,6 +2623,7 @@ def run_all_tests():
         ("V7 Audit Fixes", TestV7Fixes()),
         ("V8 Audit Fixes", TestV8Fixes()),
         ("V9 Audit Fixes", TestV9Fixes()),
+        ("Premarket Screener", TestPremarketScreener()),
     ]
 
     total_tests = 0

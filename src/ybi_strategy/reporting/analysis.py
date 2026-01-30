@@ -221,13 +221,27 @@ def stratified_analysis(
         trades["ttm_state"] = trades["entry_reason"].apply(_extract_ttm_state)
 
     # Merge gap data if available
+    # Handle both open_gap (gap_pct) and premarket_gap (premarket_pct) methods
     if watchlist_df is not None and not watchlist_df.empty:
         if "ticker" in trades.columns and "date" in trades.columns:
-            trades = trades.merge(
-                watchlist_df[["date", "ticker", "gap_pct"]],
-                on=["date", "ticker"],
-                how="left",
-            )
+            # Determine which gap column exists
+            if "gap_pct" in watchlist_df.columns:
+                gap_col = "gap_pct"
+            elif "premarket_pct" in watchlist_df.columns:
+                gap_col = "premarket_pct"
+            else:
+                gap_col = None
+
+            if gap_col:
+                merge_cols = ["date", "ticker", gap_col]
+                trades = trades.merge(
+                    watchlist_df[merge_cols],
+                    on=["date", "ticker"],
+                    how="left",
+                )
+                # Normalize column name to gap_pct for downstream analysis
+                if gap_col != "gap_pct":
+                    trades["gap_pct"] = trades[gap_col]
 
     # 1. Analysis by gap bucket
     if "gap_pct" in trades.columns:
